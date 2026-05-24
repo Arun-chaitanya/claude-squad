@@ -1,8 +1,46 @@
 #!/usr/bin/env bash
 # lib/tmux.sh — tmux session management for claude-squad
 # Creates sessions, manages panes, captures output, sends signals.
+#
+# The tmux session name is derived from $SQUAD_NAME so multiple squads can
+# run in parallel (one tmux session per squad). $SQUAD_NAME defaults to
+# "default" — preserving the single-squad workflow when no name is given.
+# bin/squad calls squad_tmux_set_session_name after parsing --name flags
+# (and after reading the .squad/current pointer) so the right session is
+# targeted for every command.
 
-SQUAD_SESSION="claude-squad"
+: "${SQUAD_NAME:=default}"
+SQUAD_SESSION="claude-squad-${SQUAD_NAME}"
+
+# Re-derive SQUAD_SESSION from $SQUAD_NAME. Call after changing SQUAD_NAME.
+squad_tmux_set_session_name() {
+  SQUAD_SESSION="claude-squad-${SQUAD_NAME}"
+}
+
+# Configure mouse behavior on a session:
+#   - mouse on  → clicking a pane focuses it
+#   - wheel rebinds → ALWAYS scroll tmux's own scrollback buffer (copy-mode),
+#     even inside alternate-screen apps like Claude Code. Claude Code maps
+#     wheel-up to <Up arrow> (history navigation, not chat scroll), so the
+#     useful behavior is to bypass the app entirely and let tmux do the
+#     scrolling. Page-by-page scroll for fewer clicks.
+# Usage: squad_tmux_configure_mouse <session>
+squad_tmux_configure_mouse() {
+  local session="$1"
+  tmux set-option -t "$session" mouse on >/dev/null
+  # Tall history buffer so chat scroll-back is meaningful.
+  tmux set-option -t "$session" history-limit 50000 >/dev/null
+
+  tmux bind-key -T root WheelUpPane \
+    "select-pane -t = ; if -F -t = '#{?pane_in_mode,1,0}' \
+       'send-keys -M' \
+       'copy-mode -e ; send-keys -X -N 3 scroll-up'" >/dev/null
+
+  tmux bind-key -T root WheelDownPane \
+    "select-pane -t = ; if -F -t = '#{?pane_in_mode,1,0}' \
+       'send-keys -X -N 3 scroll-down' \
+       'send-keys -M'" >/dev/null
+}
 
 # ─── Dynamic pane helpers (Stories 2+3) ────────────────────────────────────
 # These primitives work with stable tmux pane ids (%N), set on each pane via
@@ -101,6 +139,7 @@ squad_tmux_create_single_pane() {
   fi
 
   tmux new-session -d -s "$SQUAD_SESSION" -x 200 -y 50
+  squad_tmux_configure_mouse "$SQUAD_SESSION"
   local pane_id
   pane_id=$(tmux list-panes -t "$SQUAD_SESSION" -F '#{pane_id}' | head -1)
 
@@ -124,6 +163,7 @@ squad_tmux_create_session() {
 
   # Create session with first pane
   tmux new-session -d -s "$SQUAD_SESSION" -x 200 -y 50
+  squad_tmux_configure_mouse "$SQUAD_SESSION"
 
   # Create additional panes
   for ((i = 1; i < num_roles; i++)); do

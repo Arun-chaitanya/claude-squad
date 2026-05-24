@@ -10,6 +10,11 @@ set -euo pipefail
 SQUAD_VERSION="1.0.0"
 SQUAD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Capture env-set squad name (if any) before sourcing libs.
+# lib/tmux.sh defaults SQUAD_NAME to "default" when unset, which would
+# otherwise make "unset" indistinguishable from "set to default".
+SQUAD_NAME_FROM_ENV="${SQUAD_NAME:-}"
+
 # Source libraries
 source "${SQUAD_DIR}/lib/tmux.sh"
 source "${SQUAD_DIR}/lib/mailbox.sh"
@@ -42,6 +47,8 @@ COMMANDS:
   attach               Attach to the tmux session
   roles                List available roles
   roster               Show the live agent registry as a markdown table
+  list                 List all squads in the current repo (alias: ls)
+  use <name>           Make a squad the current one for subsequent commands
   spawn <role>         Spawn a new agent pane at runtime (e.g. coder, tester)
                        Flags: [--instance N] [--worktree|--no-worktree]
                               [--model M] [--fresh]
@@ -59,6 +66,9 @@ COMMANDS:
   merge <role>         Merge a role's worktree branch back to main
 
 OPTIONS:
+  --name <squad>       Target a specific squad. Defaults to .squad/current,
+                       SQUAD_NAME env var, or "default". Lets multiple squads
+                       run in parallel in the same repo.
   --static <r1,r2,...> Legacy fixed-roster boot (default: coder,tester).
                        Without this flag, squad start boots only the planner;
                        additional agents are spawned at runtime.
@@ -67,13 +77,16 @@ OPTIONS:
   --model <model>      Model to use (default: claude-opus-4-6)
 
 EXAMPLES:
-  squad start                              # planner-only dynamic boot
+  squad start                              # planner-only dynamic boot (squad 'default')
+  squad start --name backend               # second parallel squad in same repo
   squad start sprints/feature.md           # planner with a sprint file
   squad start --static coder,tester        # legacy fixed roster
   squad start --static planner,coder,tester --worktrees
+  squad list                               # see all squads in this repo
+  squad use backend                        # switch current squad
+  squad attach --name backend              # attach to a specific squad
   squad harness "Build a todo app"         # headless harness loop
-  squad status                             # check agent progress
-  squad attach                             # jump into tmux session
+  squad status                             # check current squad's agent progress
 
 EOF
 }
@@ -87,6 +100,78 @@ validate_role() {
   [[ -f "${SQUAD_DIR}/roles/${role}.md" ]]
 }
 
+# ─── Squad name resolution ───────────────────────────────────────
+# Multiple squads can run in parallel in the same repo. Each squad has:
+#   - a tmux session     "claude-squad-${SQUAD_NAME}"
+#   - a runtime dir      "${REPO_PATH}/.squad/${SQUAD_NAME}/"
+#
+# Priority: explicit --name flag > $SQUAD_NAME env > .squad/current pointer
+# > "default". Commands that mutate which squad is "current" (start) write
+# the .squad/current pointer so subsequent commands inherit the name without
+# the user re-typing it.
+
+# Strip the --name flag (and its value) from "$@" and echo the value, if any.
+# Usage: name=$(_extract_name_flag "$@")
+_extract_name_flag() {
+  local out=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) out="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  echo "$out"
+}
+
+# Re-build "$@" with the --name flag removed. Echoes one arg per line so the
+# caller can do: mapfile -t args < <(_strip_name_flag "$@")
+_strip_name_flag() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) shift 2 ;;
+      *) printf '%s\n' "$1"; shift ;;
+    esac
+  done
+}
+
+# Resolve the active squad name for a command that READS state (everything
+# except `start`). Returns 0 on success; exits 1 if no squad is active and
+# no fallback can be derived.
+#
+# Usage: _resolve_squad_name "$@"  (pass through the original argv so the
+# helper can see a --name flag if you gave one)
+_resolve_squad_name() {
+  local from_flag
+  from_flag=$(_extract_name_flag "$@")
+
+  if [[ -n "$from_flag" ]]; then
+    SQUAD_NAME="$from_flag"
+  elif [[ -n "$SQUAD_NAME_FROM_ENV" ]]; then
+    SQUAD_NAME="$SQUAD_NAME_FROM_ENV"
+  elif [[ -f "${REPO_PATH}/.squad/current" ]]; then
+    SQUAD_NAME=$(<"${REPO_PATH}/.squad/current")
+  else
+    SQUAD_NAME="default"
+  fi
+
+  export SQUAD_NAME
+  squad_tmux_set_session_name
+}
+
+# For `squad start`. Same priority order, but writes .squad/current after
+# resolving so subsequent commands inherit the name.
+_resolve_and_persist_squad_name() {
+  _resolve_squad_name "$@"
+  mkdir -p "${REPO_PATH}/.squad"
+  printf '%s\n' "$SQUAD_NAME" > "${REPO_PATH}/.squad/current"
+}
+
+# Per-squad runtime dir. Use AFTER _resolve_squad_name (or
+# _resolve_and_persist_squad_name) has set SQUAD_NAME.
+_squad_runtime() {
+  echo "${REPO_PATH}/.squad/${SQUAD_NAME}"
+}
+
 # ─── Commands ────────────────────────────────────────────────────
 
 cmd_start() {
@@ -94,9 +179,14 @@ cmd_start() {
   local static_roles=""
   local use_worktrees=false
   local model="claude-opus-4-6"
+  local name_flag=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --name)
+        name_flag="$2"
+        shift 2
+        ;;
       --static)
         static_roles="$2"
         shift 2
@@ -129,6 +219,15 @@ cmd_start() {
     esac
   done
 
+  # Resolve the squad name BEFORE checking session existence, so the check is
+  # scoped to the right session. Persist the chosen name to .squad/current so
+  # `squad spawn`, `squad attach` etc. inherit it without --name.
+  if [[ -n "$name_flag" ]]; then
+    _resolve_and_persist_squad_name --name "$name_flag"
+  else
+    _resolve_and_persist_squad_name
+  fi
+
   if [[ -n "$sprint_file" ]] && [[ ! -f "$sprint_file" ]]; then
     echo "Error: sprint file not found: $sprint_file" >&2
     exit 1
@@ -138,7 +237,8 @@ cmd_start() {
   fi
 
   if tmux has-session -t "$SQUAD_SESSION" 2>/dev/null; then
-    echo "Error: session '$SQUAD_SESSION' already exists. Run 'squad stop' first." >&2
+    echo "Error: squad '${SQUAD_NAME}' is already running (tmux session '$SQUAD_SESSION')." >&2
+    echo "       Run 'squad stop --name ${SQUAD_NAME}' first, or start a different squad with --name <other>." >&2
     exit 1
   fi
 
@@ -159,6 +259,7 @@ _cmd_start_dynamic() {
   echo "║  Claude Squad v${SQUAD_VERSION}                               ║"
   echo "╚══════════════════════════════════════════════════════╝"
   echo ""
+  echo "Squad:      ${SQUAD_NAME}  (tmux session '${SQUAD_SESSION}')"
   echo "Mode:       dynamic (planner-only boot; spawn peers with 'squad spawn <role>')"
   echo "Repo:       $REPO_PATH"
   echo "Sprint:     ${sprint_file:-none}"
@@ -166,7 +267,8 @@ _cmd_start_dynamic() {
   echo "Model:      $model"
   echo ""
 
-  local squad_runtime="${REPO_PATH}/.squad"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   mkdir -p "$squad_runtime"
 
   local session_id
@@ -265,6 +367,7 @@ _cmd_start_static() {
   echo "║  Claude Squad v${SQUAD_VERSION}                               ║"
   echo "╚══════════════════════════════════════════════════════╝"
   echo ""
+  echo "Squad:      ${SQUAD_NAME}  (tmux session '${SQUAD_SESSION}')"
   echo "Mode:       static (legacy fixed roster)"
   echo "Repo:       $REPO_PATH"
   echo "Roles:      ${roles[*]}"
@@ -273,7 +376,8 @@ _cmd_start_static() {
   echo "Model:      $model"
   echo ""
 
-  local squad_runtime="${REPO_PATH}/.squad"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   mkdir -p "$squad_runtime"
 
   local session_id
@@ -347,7 +451,9 @@ HEREDOC
 }
 
 cmd_stop() {
-  local squad_runtime="${REPO_PATH}/.squad"
+  _resolve_squad_name "$@"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
 
   # Clean up worktrees if they exist
   if [[ -f "${squad_runtime}/session.json" ]]; then
@@ -364,21 +470,43 @@ cmd_stop() {
   # Kill tmux session
   squad_tmux_kill_session
 
-  echo "Squad stopped."
+  # If we just stopped the squad recorded in .squad/current, clear the pointer
+  # so subsequent commands don't try to target a dead squad.
+  if [[ -f "${REPO_PATH}/.squad/current" ]]; then
+    local current
+    current=$(<"${REPO_PATH}/.squad/current")
+    if [[ "$current" == "$SQUAD_NAME" ]]; then
+      rm -f "${REPO_PATH}/.squad/current"
+    fi
+  fi
+
+  echo "Squad '${SQUAD_NAME}' stopped."
 }
 
 cmd_status() {
-  local squad_runtime="${REPO_PATH}/.squad"
+  _resolve_squad_name "$@"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   squad_monitor_status "$squad_runtime" "$REPO_PATH"
 }
 
 cmd_watch() {
-  local squad_runtime="${REPO_PATH}/.squad"
-  local interval="${1:-5}"
+  _resolve_squad_name "$@"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
+  # Strip --name from positional args so $1 is still the interval.
+  local interval=5
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) shift 2 ;;
+      *) interval="$1"; shift ;;
+    esac
+  done
   squad_monitor_watch "$squad_runtime" "$REPO_PATH" "$interval"
 }
 
 cmd_attach() {
+  _resolve_squad_name "$@"
   squad_tmux_attach
 }
 
@@ -405,12 +533,86 @@ cmd_init() {
 }
 
 cmd_roster() {
-  local squad_runtime="${REPO_PATH}/.squad"
+  _resolve_squad_name "$@"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   if [[ ! -f "${squad_runtime}/session.json" ]]; then
-    echo "No active squad session in ${REPO_PATH}" >&2
+    echo "No active squad '${SQUAD_NAME}' in ${REPO_PATH}" >&2
     exit 1
   fi
   squad_registry_roster_markdown "$squad_runtime"
+}
+
+# List all squads in the current repo. A squad is any subdirectory of
+# .squad/ that has a session.json. Marks which one .squad/current points at
+# and whether its tmux session is alive.
+cmd_list() {
+  local root="${REPO_PATH}/.squad"
+  if [[ ! -d "$root" ]]; then
+    echo "No squads in ${REPO_PATH}"
+    return 0
+  fi
+
+  local current=""
+  [[ -f "${root}/current" ]] && current=$(<"${root}/current")
+
+  local found=false
+  printf '%-3s  %-20s  %-8s  %-7s  %s\n' "" "NAME" "TMUX" "AGENTS" "STARTED"
+  printf '%-3s  %-20s  %-8s  %-7s  %s\n' "" "----" "----" "------" "-------"
+
+  local dir name marker tmux_status agents started session_name
+  for dir in "$root"/*/; do
+    [[ -d "$dir" ]] || continue
+    [[ -f "${dir}session.json" ]] || continue
+    found=true
+
+    name=$(basename "$dir")
+    marker=" "
+    [[ "$name" == "$current" ]] && marker="*"
+
+    session_name="claude-squad-${name}"
+    if tmux has-session -t "$session_name" 2>/dev/null; then
+      tmux_status="alive"
+    else
+      tmux_status="dead"
+    fi
+
+    agents=$(jq -r '[.agents[] | select(.status == "alive")] | length' \
+      "${dir}session.json" 2>/dev/null || echo "?")
+    started=$(jq -r '.start_time // .agents[0].spawned_at // "-"' \
+      "${dir}session.json" 2>/dev/null)
+
+    printf '%-3s  %-20s  %-8s  %-7s  %s\n' "$marker" "$name" "$tmux_status" "$agents" "$started"
+  done
+
+  if ! $found; then
+    echo "No squads in ${REPO_PATH}"
+    return 0
+  fi
+
+  echo ""
+  echo "* = current squad (set by most recent 'squad start' or 'squad use')"
+  echo "Use 'squad <command> --name <NAME>' to target a specific squad,"
+  echo "or 'squad use <NAME>' to make it current for subsequent commands."
+}
+
+# Switch the .squad/current pointer to a given squad name. Read-only for
+# the squad itself — only changes which squad subsequent commands target.
+cmd_use() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: squad use <name>" >&2
+    exit 1
+  fi
+  local target="${REPO_PATH}/.squad/${name}/session.json"
+  if [[ ! -f "$target" ]]; then
+    echo "Error: no squad named '${name}' in ${REPO_PATH}" >&2
+    echo "       Run 'squad list' to see available squads." >&2
+    exit 1
+  fi
+  mkdir -p "${REPO_PATH}/.squad"
+  printf '%s\n' "$name" > "${REPO_PATH}/.squad/current"
+  echo "Current squad → ${name}"
 }
 
 # Acquire the spawn lock so two concurrent spawns can't pick the same instance.
@@ -436,8 +638,10 @@ _spawn_lock_release() {
   rm -rf "${1}/spawn.lock"
 }
 
-# squad spawn <role> [--instance N] [--worktree] [--no-worktree] [--model M] [--fresh]
+# squad spawn <role> [--instance N] [--worktree] [--no-worktree] [--model M] [--fresh] [--name <squad>]
 cmd_spawn() {
+  _resolve_squad_name "$@"
+
   local role=""
   local force_instance=""
   local worktree_flag=""     # "" = inherit session default; "1" = force on; "0" = force off
@@ -446,6 +650,7 @@ cmd_spawn() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --name)        shift 2 ;;  # already consumed by _resolve_squad_name
       --instance)    force_instance="$2"; shift 2 ;;
       --worktree)    worktree_flag="1"; shift ;;
       --no-worktree) worktree_flag="0"; shift ;;
@@ -457,7 +662,7 @@ cmd_spawn() {
   done
 
   if [[ -z "$role" ]]; then
-    echo "Usage: squad spawn <role> [--instance N] [--worktree|--no-worktree] [--model M] [--fresh]" >&2
+    echo "Usage: squad spawn <role> [--instance N] [--worktree|--no-worktree] [--model M] [--fresh] [--name <squad>]" >&2
     exit 1
   fi
 
@@ -473,9 +678,10 @@ cmd_spawn() {
     exit 1
   fi
 
-  local squad_runtime="${REPO_PATH}/.squad"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   if [[ ! -f "${squad_runtime}/session.json" ]]; then
-    echo "Error: no active session. Run 'squad start' first." >&2
+    echo "Error: no active squad '${SQUAD_NAME}'. Run 'squad start' first." >&2
     exit 1
   fi
   if ! tmux has-session -t "$SQUAD_SESSION" 2>/dev/null; then
@@ -638,14 +844,17 @@ _next_free_instance() {
   echo "$i"
 }
 
-# squad kill <name> [--hard] [--grace-seconds N]
+# squad kill <name> [--hard] [--grace-seconds N] [--name <squad>]
 cmd_kill() {
+  _resolve_squad_name "$@"
+
   local name=""
   local hard=false
   local grace=10
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --name)           shift 2 ;;  # consumed by _resolve_squad_name
       --hard)           hard=true; shift ;;
       --grace-seconds)  grace="$2"; shift 2 ;;
       -*)               echo "Unknown option: $1" >&2; exit 1 ;;
@@ -654,17 +863,18 @@ cmd_kill() {
   done
 
   if [[ -z "$name" ]]; then
-    echo "Usage: squad kill <name> [--hard] [--grace-seconds N]" >&2
+    echo "Usage: squad kill <name> [--hard] [--grace-seconds N] [--name <squad>]" >&2
     exit 1
   fi
 
-  local squad_runtime="${REPO_PATH}/.squad"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   if [[ ! -f "${squad_runtime}/session.json" ]]; then
-    echo "Error: no active session." >&2
+    echo "Error: no active squad '${SQUAD_NAME}'." >&2
     exit 1
   fi
   if ! tmux has-session -t "$SQUAD_SESSION" 2>/dev/null; then
-    echo "Error: tmux session is not running." >&2
+    echo "Error: tmux session '$SQUAD_SESSION' is not running." >&2
     exit 1
   fi
 
@@ -709,9 +919,11 @@ cmd_kill() {
 
 # squad doctor — reconcile registry vs tmux. Flips orphans to vanished.
 cmd_doctor() {
-  local squad_runtime="${REPO_PATH}/.squad"
+  _resolve_squad_name "$@"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   if [[ ! -f "${squad_runtime}/session.json" ]]; then
-    echo "No active squad session in ${REPO_PATH}" >&2
+    echo "No active squad '${SQUAD_NAME}' in ${REPO_PATH}" >&2
     exit 1
   fi
 
@@ -748,15 +960,26 @@ cmd_doctor() {
 # This is a MECHANISM. It does not interpret the numbers or decide anything.
 # The planner reads it and makes its own judgment about recycling.
 cmd_usage() {
-  local name="${1:-}"
+  _resolve_squad_name "$@"
+
+  local name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) shift 2 ;;  # consumed
+      -*)     echo "Unknown option: $1" >&2; exit 1 ;;
+      *)      name="$1"; shift ;;
+    esac
+  done
+
   if [[ -z "$name" ]]; then
-    echo "Usage: squad usage <name>" >&2
+    echo "Usage: squad usage <agent-name> [--name <squad>]" >&2
     exit 1
   fi
 
-  local squad_runtime="${REPO_PATH}/.squad"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   if [[ ! -f "${squad_runtime}/session.json" ]]; then
-    echo "Error: no active session." >&2
+    echo "Error: no active squad '${SQUAD_NAME}'." >&2
     exit 1
   fi
 
@@ -852,6 +1075,8 @@ cmd_usage() {
 # this is a "context refresh after fatigue" verb. Pass --fresh to start with
 # a brand-new Claude session.
 cmd_recycle() {
+  _resolve_squad_name "$@"
+
   local name=""
   local reason=""
   local grace="10"
@@ -859,6 +1084,7 @@ cmd_recycle() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --name)           shift 2 ;;  # consumed
       --reason)         reason="$2"; shift 2 ;;
       --grace-seconds)  grace="$2"; shift 2 ;;
       --fresh)          fresh_flag="--fresh"; shift ;;
@@ -868,13 +1094,14 @@ cmd_recycle() {
   done
 
   if [[ -z "$name" ]]; then
-    echo "Usage: squad recycle <name> [--reason \"...\"] [--grace-seconds N] [--fresh]" >&2
+    echo "Usage: squad recycle <name> [--reason \"...\"] [--grace-seconds N] [--fresh] [--name <squad>]" >&2
     exit 1
   fi
 
-  local squad_runtime="${REPO_PATH}/.squad"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   if [[ ! -f "${squad_runtime}/session.json" ]]; then
-    echo "Error: no active session." >&2
+    echo "Error: no active squad '${SQUAD_NAME}'." >&2
     exit 1
   fi
 
@@ -893,13 +1120,15 @@ cmd_recycle() {
     "{\"name\":\"${name}\",\"reason\":\"${reason}\",\"grace_seconds\":${grace},\"fresh\":$([ -n "$fresh_flag" ] && echo true || echo false)}"
 
   echo "Recycling ${name}${reason:+ — reason: ${reason}}"
-  cmd_kill "$name" --grace-seconds "$grace"
+  # Pass --name through to nested calls so they target the same squad even
+  # when .squad/current points at a different one.
+  cmd_kill --name "$SQUAD_NAME" "$name" --grace-seconds "$grace"
   # cmd_kill exits on error; if we got here it succeeded.
 
   if [[ -n "$fresh_flag" ]]; then
-    cmd_spawn "$role" --instance "$(echo "$prior" | jq -r '.instance')" $fresh_flag
+    cmd_spawn --name "$SQUAD_NAME" "$role" --instance "$(echo "$prior" | jq -r '.instance')" $fresh_flag
   else
-    cmd_spawn "$role" --instance "$(echo "$prior" | jq -r '.instance')"
+    cmd_spawn --name "$SQUAD_NAME" "$role" --instance "$(echo "$prior" | jq -r '.instance')"
   fi
 }
 
@@ -916,16 +1145,26 @@ cmd_harness() {
 }
 
 cmd_merge() {
-  local role="${1:-}"
-  local squad_runtime="${REPO_PATH}/.squad"
+  _resolve_squad_name "$@"
+
+  local role=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) shift 2 ;;  # consumed
+      -*)     echo "Unknown option: $1" >&2; exit 1 ;;
+      *)      role="$1"; shift ;;
+    esac
+  done
 
   if [[ -z "$role" ]]; then
-    echo "Usage: squad merge <role>" >&2
+    echo "Usage: squad merge <role> [--name <squad>]" >&2
     exit 1
   fi
 
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
   if [[ ! -f "${squad_runtime}/session.json" ]]; then
-    echo "Error: no active session found" >&2
+    echo "Error: no active squad '${SQUAD_NAME}' found." >&2
     exit 1
   fi
 
@@ -946,15 +1185,17 @@ main() {
 
   case "$command" in
     start)    cmd_start "$@" ;;
-    stop)     cmd_stop ;;
-    status)   cmd_status ;;
+    stop)     cmd_stop "$@" ;;
+    status)   cmd_status "$@" ;;
     watch)    cmd_watch "$@" ;;
-    attach)   cmd_attach ;;
+    attach)   cmd_attach "$@" ;;
     roles)    cmd_roles ;;
-    roster)   cmd_roster ;;
+    roster)   cmd_roster "$@" ;;
+    list|ls)  cmd_list ;;
+    use)      cmd_use "$@" ;;
     spawn)    cmd_spawn "$@" ;;
     kill)     cmd_kill "$@" ;;
-    doctor)   cmd_doctor ;;
+    doctor)   cmd_doctor "$@" ;;
     usage)    cmd_usage "$@" ;;
     recycle)  cmd_recycle "$@" ;;
     init)     cmd_init ;;
