@@ -12,7 +12,26 @@ The end-state is rebuilt on the existing mailbox (which is already routing-flexi
 
 ## End-state architecture (one paragraph)
 
-`squad start` opens a tmux session with only the planner. Pane identity is by role-instance name (e.g. `coder`, `coder-2`), looked up via a small registry backed by tmux `@agent_role` user options on stable `%N` pane ids. New CLI verbs `squad spawn <role>`, `squad kill <role>`, `squad roster`, `squad doctor` make the topology live. The mailbox gains lifecycle message types (`request_spawn`, `request_close`, `request_keep_alive`, `handoff_ready`, `arbitrate`, `redirect`) but its storage and routing stay identical. Each role's system prompt is rewritten so its top section is "Human Interrupt Is Sovereign" — stdin from you always wins over any mailbox instruction. Each agent continuously maintains `.squad/handoff-{name}.md` so kill-at-any-moment is safe. Sprints become vertical-slice stories: each one a complete demoable UI flow, each subsequent story extending the prior.
+`squad start` opens a tmux session with only the planner. Pane identity is by role-instance name (e.g. `coder`, `coder-2`), looked up via a small registry backed by tmux `@agent_role` user options on stable `%N` pane ids. New CLI verbs `squad spawn <role>`, `squad kill <role>`, `squad roster`, `squad doctor` make the topology live. The mailbox gains lifecycle event types (`agent_spawned`, `agent_closing`, `agent_closed`, `agent_vanished`, `retiring_in`) but its storage and routing stay identical. Each agent can choose to maintain `.squad/handoff-{name}.md` when killed, and `squad spawn` doesn't auto-inject a resume preamble — the agent that invokes the spawn (usually the planner) decides whether/how to brief the new instance about prior state. Sprints are vertical-slice stories: each one a complete demoable UI flow.
+
+---
+
+## Design intent — read this before changing anything
+
+**The harness provides MECHANISMS only. All POLICY is dynamic and lives in conversation.**
+
+What this means in practice:
+
+- The CLI verbs (`squad spawn`, `squad kill`, `squad doctor`, `squad roster`) are mechanism. They give agents the ability to create, retire, and observe peers. *When* to call them is the agent's judgment in the moment.
+- System prompts (`.squad/prompt-<name>.md`) describe mechanism — who you are, where files are, how the mailbox works. They do NOT prescribe workflow, handoff format, conversational ceremony, or behavior rules the model already handles by default.
+- When the planner spawns a coder, the planner briefs it via a follow-up message — not via static prompt-file content. The brief is whatever the situation requires. If there's a handoff to resume from, the planner says "read `.squad/handoff-coder.md` and tell me what you're picking up." If it's a fresh task, the planner just states the task.
+- `squad spawn` does NOT prepend a "you are resuming" preamble even when a handoff file exists. The file is a *mechanism* (persists across kill/spawn cycles); whoever invokes the spawn decides whether and how to use it.
+- `squad start` does NOT send a kick-off prompt to the planner. The first user turn (you typing in the pane) is the brief.
+- No "Section 0: HUMAN INTERRUPT IS SOVEREIGN" rules in role files. The model already listens to the most recent stdin in a pane. Don't fight defaults.
+- No "Handoff Hygiene" sections enumerating required fields. The planner decides what each handoff should contain based on the situation.
+- No "always check `docs/`" directives. The user/planner passes pointers in conversation.
+
+**Future improvements go in skills, not in role prompts.** Patterns like structured-handoff, fatigue-watcher, or sprint-arbitration can be packaged as skills and invoked when needed, but the base prompts stay minimal.
 
 ---
 
@@ -91,35 +110,27 @@ Rule: **after every story the squad is fully usable end-to-end up to the capabil
 
 ---
 
-### Story 4 — Respawning a killed agent picks up where it left off
+### Story 4 — Respawn resurrects the Claude conversation itself
 
-**What ships:** `squad spawn coder` now checks for `.squad/handoff-coder.md` and, if present, prepends a "Resumption Context — read this file first" preamble to the generated prompt. If a worktree already exists for that role+session, reuse it. Instance numbers prefer reuse (killed `coder-2` resumes as `coder-2`, not `coder-3`). New `--fresh` flag on spawn renames the handoff to `.archived` if you want a clean start.
+**What ships:** Pure mechanism. No prompt-content changes.
+
+- **Claude session id persists across kill/spawn.** Every agent is launched with a stable UUID via `claude --session-id <uuid>` (assigned at spawn time and stored in the registry). On graceful kill, the id remains in the registry under the killed entry. When the same name is respawned, the launcher uses `claude --resume <uuid>` instead — the new pane comes back as *the same Claude conversation*, with full history, todos, scratchpad intact. This is qualitatively stronger than handoff-file resumption.
+- **Instance numbers are resurrected, not climbed.** When `coder` is killed and you spawn `coder` again, it comes back as `coder` (instance 1), not `coder-2`. The killed entry is removed and the new alive entry takes its place. Only when you want a *parallel* second instance alongside the alive one does the number climb.
+- **Worktree is reused** if one exists from a prior life — uncommitted work is preserved.
+- **`--fresh` discards both** the prior Claude session id (generates a new UUID) and the handoff file (renamed to `.archived-<ts>.md`).
+- **No auto-injected resume preamble.** The system prompt does NOT tell the resurrected agent "you are resuming — read the handoff file." The planner briefs it via a follow-up message if a brief is needed. Mechanism only; policy stays in conversation.
 
 **Demo after this story:**
-- Run Story 3's demo so `coder-2` has a populated handoff and worktree with uncommitted work.
-- `squad spawn coder` (or `squad spawn coder --instance 2`) → new pane comes up, agent's first action is reading the handoff, it summarizes "I was working on X, next step is Y."
-- It picks up the same worktree (verify with `git -C ...worktrees/.../coder-2 status`).
-- `squad spawn coder --fresh` → handoff renamed `.archived-<ts>.md`, new agent starts clean.
+- `squad start --worktrees`, `squad spawn coder`, do some work.
+- `squad kill coder` → handoff file preserved (if the agent wrote one), worktree intact, registry remembers the Claude session id.
+- `squad spawn coder` → CLI prints "Resurrected coder — Claude conversation resumed." The launcher now uses `--resume <uuid>`. New pane has the full prior conversation visible.
+- `squad spawn coder --fresh` → CLI assigns a new UUID, archives handoff, launcher uses `--session-id` (fresh conversation).
 
-**Out of scope this story:** anything in the mailbox or role-prompt protocol layer beyond the resume preamble.
+**Out of scope this story:** any role-prompt changes, any auto-brief injection.
 
 ---
 
-### Story 5 — Human-interrupt protocol: typing in any pane immediately steers that agent
-
-**What ships:** Section 0 ("HUMAN INTERRUPT IS SOVEREIGN") added to the top of `roles/planner.md`, `roles/coder.md`, `roles/tester.md`, `roles/reviewer.md`. Defines: pause, update handoff, acknowledge in one sentence, ask at most one clarifying question, send `redirect` mailbox to planner, follow new direction. The precedence ladder (HUMAN_STDIN > AGENT_JUDGMENT > MAILBOX `arbitrate` > MAILBOX `request` > MAILBOX `notification`) is stated explicitly. The mailbox gains a `redirect` type so the coder can echo the human override back to planner.
-
-**Demo after this story:**
-- `squad start`, `squad spawn coder`, ask planner via mailbox to tell coder "build feature X using Redux."
-- While coder is mid-implementation, switch to coder's pane and type "stop — use Zustand instead, not Redux."
-- Verify within ~10s: coder acknowledges in one sentence, `.squad/handoff-coder.md` updates to reflect the pivot, a `redirect` message lands in mailbox from coder→planner, coder begins the new direction.
-- Type "continue what you were doing" → coder explicitly resumes the prior task (only when you say so).
-
-**Out of scope this story:** automated arbitration of competing peer requests, named-instance spawning by the planner. Just the interrupt behavior.
-
----
-
-### Story 6 — Free-flowing peer collaboration with planner-driven recycling
+### Story 5 — Free-flowing peer collaboration with planner-driven recycling
 
 **What ships:** Two things working together.
 
@@ -146,11 +157,11 @@ Planner reads these on each cycle and decides whether to recycle. Recycle = `squ
 - During 1.2, push the coder hard (force it to use ~140k tokens). On next cycle, planner sees the budget signal and proactively recycles it after current work flushes.
 - Inspect: `cat .squad/mailbox.jsonl | jq` shows the free-flowing peer messages + the planner's retiring/spawn events with rationale in the body.
 
-**Out of scope this story:** vertical-slice sprint template (Story 7), MCP Playwright (Story 8), reviewer (Story 9).
+**Out of scope this story:** vertical-slice sprint template (Story 6), MCP Playwright (Story 7), reviewer (Story 8).
 
 ---
 
-### Story 7 — Vertical-slice sprint template + interactive planner workflow
+### Story 6 — Vertical-slice sprint template + interactive planner workflow
 
 **What ships:** `templates/sprint.md` fully rewritten to the vertical-slice schema (Title, User-observable outcome, Acceptance criteria, Out of scope, Builds on, inline Coder notes / Test results, status `[PENDING|CURRENT|TESTING|DONE|BLOCKED|USER_OVERRIDE]`). `roles/planner.md` workflow rewritten: interactive-first dialogue with you to refine stories one at a time, then write `.squad/spec.md` only when you say "looks good," never auto-spawn (wait for "go"/"start"/"spawn"), mid-flight revision updates `.squad/spec.md` in place with `[REVISED]` markers. `roles/coder.md` workflow rewritten to Explore → Plan → Implement → Verify with a `notification` broadcast at the Plan phase so peers see intent.
 
@@ -166,7 +177,7 @@ Planner reads these on each cycle and decides whether to recycle. Recycle = `squ
 
 ---
 
-### Story 8 — Tester uses MCP Playwright (hybrid: agentic exploration + durable spec files)
+### Story 7 — Tester uses MCP Playwright (hybrid: agentic exploration + durable spec files)
 
 **What ships:** `roles/tester.md` workflow rewritten. The old raw-Playwright-CLI section is deleted. New protocol: navigate via `mcp__playwright__browser_navigate`, snapshot via `browser_snapshot` to get semantic refs, drive via `browser_click` / `browser_fill_form` / `browser_type` on refs (DOM-change-resilient), screenshot at each verification point. For each story: happy path + one edge case + one failure mode (no more, no less). For passing flows, encode as a durable `tests/sprint-{N}-story-{M}.spec.ts` regression artifact. Tester can `clarify` directly to coder (no planner middleman). Tester can `request_spawn reviewer` if it sees architecture/security issues outside its scope.
 
@@ -180,12 +191,12 @@ Planner reads these on each cycle and decides whether to recycle. Recycle = `squ
 
 ---
 
-### Story 9 — Reviewer role: on-demand spawn, self-close protocol
+### Story 8 — Reviewer role: on-demand spawn, self-close protocol
 
 **What ships:** `roles/reviewer.md` updated. Reviewer is no longer in the default roster; it only exists because some peer sent `request_spawn reviewer` to the planner. Reviewer reads the originating request's body to learn scope, reviews the diff, delivers findings as a `result` message, then either `request_close self` (no follow-up needed) or `request_keep_alive coder` (critical fixes needed). Section 0 + handoff discipline as in other roles.
 
 **Demo after this story:**
-- Run Story 8's demo. After a story passes tester, ask tester (via direct prompt) to escalate: "the auth code feels brittle, ask for a reviewer."
+- Run Story 7's demo. After a story passes tester, ask tester (via direct prompt) to escalate: "the auth code feels brittle, ask for a reviewer."
 - Tester sends `request_spawn reviewer` with scope (file paths from coder's notes).
 - Reviewer spawns, reads scope from the request body, posts findings to mailbox as `result`.
 - Reviewer self-closes via `request_close self`; planner arbitrates and acks; reviewer's pane disappears.
@@ -195,7 +206,7 @@ Planner reads these on each cycle and decides whether to recycle. Recycle = `squ
 
 ---
 
-## Verification at full completion (after Story 9)
+## Verification at full completion (after Story 8)
 
 End-to-end demo on a fresh scratch repo:
 1. `squad start` → planner-only pane appears.

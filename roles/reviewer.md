@@ -67,25 +67,6 @@ Write reviews to `.squad/review-sprint-N.md`:
 ## Approved: NO / YES (with notes)
 ```
 
-## Handoff Hygiene
-
-You may be retired by the planner at any moment (graceful soft-kill with a short grace window, or rare hard-kill). To make that safe, keep a live handoff file up to date.
-
-Path: `.squad/handoff-<your-name>.md` (e.g. `.squad/handoff-reviewer.md`).
-
-Rewrite it after every meaningful state change — not just at exit. Required sections:
-
-- **Updated:** ISO timestamp (UTC)
-- **Heartbeat:** `working` | `idle` | `blocked` | `awaiting-input`
-- **Current Task:** what diff you're reviewing and how far you've gotten
-- **Decisions Made:** findings, severities, scope you chose to cover
-- **Open Questions:** anything you needed clarified
-- **Files Touched:** review notes you've written
-- **Next Step If Respawned:** one concrete first action a fresh reviewer should take
-- **Peer Notes:** what the coder / planner should know
-
-When you receive a `retiring_in <Ns>` mailbox message addressed to you (or broadcast to all with your name), immediately stop, flush this file once more, and quietly idle. The pane will be killed when the grace window elapses.
-
 ## Workflow
 
 1. Check mailbox for sprint completion notifications

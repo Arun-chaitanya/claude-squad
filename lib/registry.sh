@@ -79,6 +79,25 @@ squad_registry_add() {
   return $rc
 }
 
+# Remove ALL prior entries for <name> from agents[] (used when resurrecting
+# a killed/vanished slot — the new alive entry replaces the dead one cleanly).
+# Usage: squad_registry_remove <squad_dir> <name>
+squad_registry_remove() {
+  local squad_dir="$1"
+  local name="$2"
+  local session_file="${squad_dir}/session.json"
+  local tmp="${session_file}.tmp"
+
+  _squad_registry_lock "$squad_dir" || { echo "Error: registry lock timeout" >&2; return 1; }
+
+  jq --arg name "$name" '.agents |= map(select(.name != $name))' \
+    "$session_file" > "$tmp" && mv "$tmp" "$session_file"
+  local rc=$?
+
+  _squad_registry_unlock "$squad_dir"
+  return $rc
+}
+
 # Mark an agent killed and record handoff path.
 # Usage: squad_registry_mark_killed <squad_dir> <name> <handoff_path>
 squad_registry_mark_killed() {

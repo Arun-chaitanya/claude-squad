@@ -184,9 +184,11 @@ _cmd_start_dynamic() {
   fi
 
   echo "Generating planner prompt..."
+  local planner_claude_sid
+  planner_claude_sid=$(uuidgen | tr 'A-Z' 'a-z')
   squad_prompt_generate_dynamic "$squad_runtime" "planner" "planner" "$planner_workdir" "$sprint_file" >/dev/null
-  squad_prompt_launcher_dynamic "$squad_runtime" "planner" "$planner_workdir" "$model" >/dev/null
-  echo "  Wrote prompt-planner.md and launch-planner.sh"
+  squad_prompt_launcher_dynamic "$squad_runtime" "planner" "$planner_workdir" "$model" "$planner_claude_sid" "0" >/dev/null
+  echo "  Wrote prompt-planner.md and launch-planner.sh (claude session ${planner_claude_sid})"
   echo ""
 
   echo "Creating tmux session..."
@@ -199,9 +201,11 @@ _cmd_start_dynamic() {
   agent_json=$(jq -n \
     --arg role "planner" --argjson instance 1 --arg name "planner" \
     --arg pane_id "$pane_id" --arg wt "$planner_wt" --arg model "$model" \
+    --arg claude_sid "$planner_claude_sid" \
     --arg spawned_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
     '{role:$role, instance:$instance, name:$name, pane_id:$pane_id,
-      worktree_path:$wt, model:$model, spawned_at:$spawned_at, status:"alive"}')
+      worktree_path:$wt, model:$model, claude_session_id:$claude_sid,
+      spawned_at:$spawned_at, status:"alive"}')
   squad_registry_add "$squad_runtime" "$agent_json"
 
   echo "Launching planner..."
@@ -209,13 +213,11 @@ _cmd_start_dynamic() {
   echo "  planner launched"
   echo ""
 
+  # No kick-off prompt is injected. The harness boots the planner with its
+  # system prompt; the first user turn (you, typing into the pane) is the
+  # brief. This keeps the harness mechanism-only — no policy in CLI strings.
   echo "Waiting for Claude Code to initialize..."
-  sleep 8
-
-  local kickoff
-  kickoff="Hi — you are the planner. The user is here and ready to chat. Greet them in one sentence and ask what they want to build. Do NOT write any spec, do NOT spawn any other agents yet. Just have an interactive conversation. When the user explicitly says 'go' or 'start' (later in the chat), you'll then plan and hand off."
-  squad_tmux_send_pane "$pane_id" "$kickoff"
-  echo "  Kick-off prompt sent to planner"
+  sleep 4
   echo ""
 
   _attach_or_hint
@@ -328,24 +330,12 @@ HEREDOC
     fi
   done
 
+  # No per-role kick-off prompts. Agents boot with their system prompt and
+  # wait for instruction — from the user (typing in a pane) or from peers
+  # (via mailbox). The harness mechanism does not prescribe their first move.
   echo ""
   echo "Waiting for agents to initialize..."
-  sleep 8
-
-  for ((i = 0; i < ${#roles[@]}; i++)); do
-    local role="${roles[$i]}"
-    local kickoff=""
-    case "$role" in
-      coder)    kickoff="Read the sprint file and begin your workflow. Implement the sprint marked [CURRENT]." ;;
-      tester)   kickoff="Read the sprint file and begin your workflow. Check for [TESTING] sprints. If none, poll the mailbox every 30 seconds." ;;
-      planner)  kickoff="Read the sprint file and begin your workflow. Expand the spec and define sprint contracts." ;;
-      reviewer) kickoff="Read the sprint file and begin your workflow. Review any code changes and provide feedback." ;;
-      *)        kickoff="Read the sprint file and mailbox, then begin your workflow." ;;
-    esac
-    squad_tmux_send "$i" "$kickoff"
-    echo "  Pane $i: $role — kick-off prompt sent"
-  done
-
+  sleep 4
   echo ""
   _attach_or_hint
 }
@@ -518,12 +508,36 @@ cmd_spawn() {
     exit 1
   fi
 
-  # Archive the handoff if --fresh was requested.
+  # Detect resurrection: is there a prior killed/vanished entry for this name?
+  local prior
+  prior=$(squad_registry_get "$squad_runtime" "$name")
+  local prior_status=""
+  local prior_session_id=""
+  if [[ -n "$prior" ]]; then
+    prior_status=$(echo "$prior" | jq -r '.status')
+    prior_session_id=$(echo "$prior" | jq -r '.claude_session_id // ""')
+  fi
+  local is_resurrection=false
+  if [[ -n "$prior" ]] && [[ "$prior_status" != "alive" ]] && ! $fresh; then
+    is_resurrection=true
+  fi
+
+  # --fresh: archive the prior handoff so the new agent starts blank.
   if $fresh && [[ -f "${squad_runtime}/handoff-${name}.md" ]]; then
     local ts
     ts=$(date -u +%s)
     mv "${squad_runtime}/handoff-${name}.md" "${squad_runtime}/handoff-${name}.archived-${ts}.md"
     echo "  Archived prior handoff to handoff-${name}.archived-${ts}.md"
+  fi
+
+  # Claude session id. Resurrection reuses the prior id; everything else gets
+  # a freshly-generated UUID assigned at spawn time so we own the identifier.
+  local claude_session_id
+  if $is_resurrection && [[ -n "$prior_session_id" ]]; then
+    claude_session_id="$prior_session_id"
+    echo "  Resurrecting ${name} with Claude session ${claude_session_id}"
+  else
+    claude_session_id=$(uuidgen | tr 'A-Z' 'a-z')
   fi
 
   # Worktree (reuse if already present from a prior life).
@@ -545,46 +559,74 @@ cmd_spawn() {
   fi
 
   squad_prompt_generate_dynamic "$squad_runtime" "$name" "$role" "$work_dir" "$session_sprint" >/dev/null
-  squad_prompt_launcher_dynamic "$squad_runtime" "$name" "$work_dir" "$model" >/dev/null
+
+  local resume_flag="0"
+  $is_resurrection && resume_flag="1"
+  squad_prompt_launcher_dynamic "$squad_runtime" "$name" "$work_dir" "$model" "$claude_session_id" "$resume_flag" >/dev/null
 
   local pane_id
   pane_id=$(squad_tmux_spawn "$role" "$instance" "bash ${squad_runtime}/launch-${name}.sh")
+
+  # Drop any prior entry for this name (killed/vanished) so the registry has
+  # exactly one row per name reflecting the current alive state.
+  if [[ -n "$prior" ]]; then
+    squad_registry_remove "$squad_runtime" "$name"
+  fi
 
   local agent_json
   agent_json=$(jq -n \
     --arg role "$role" --argjson instance "$instance" --arg name "$name" \
     --arg pane_id "$pane_id" --arg wt "$wt_path" --arg model "$model" \
+    --arg claude_sid "$claude_session_id" \
     --arg spawned_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
     '{role:$role, instance:$instance, name:$name, pane_id:$pane_id,
-      worktree_path:$wt, model:$model, spawned_at:$spawned_at, status:"alive"}')
+      worktree_path:$wt, model:$model, claude_session_id:$claude_sid,
+      spawned_at:$spawned_at, status:"alive"}')
   squad_registry_add "$squad_runtime" "$agent_json"
 
   squad_mailbox_send "$squad_runtime" "system" "all" "agent_spawned" \
-    "{\"name\":\"${name}\",\"role\":\"${role}\",\"pane_id\":\"${pane_id}\"}"
+    "{\"name\":\"${name}\",\"role\":\"${role}\",\"pane_id\":\"${pane_id}\",\"claude_session_id\":\"${claude_session_id}\",\"resumed\":${is_resurrection}}"
 
   _spawn_lock_release "$squad_runtime"
 
-  echo "Spawned ${name} (${pane_id}) in ${work_dir}"
+  if $is_resurrection; then
+    echo "Resurrected ${name} (${pane_id}) in ${work_dir} — Claude conversation resumed."
+  else
+    echo "Spawned ${name} (${pane_id}) in ${work_dir}"
+  fi
 }
 
-# Lowest free instance ≥1 for a role: walks alive panes + the registry's
-# killed/vanished records and returns the first integer that isn't taken.
+# Pick an instance number for spawning a new agent of <role>.
+#
+# Policy: prefer to RESURRECT the lowest-numbered killed/vanished slot for
+# this role (so kill+respawn of "coder" comes back as "coder", not "coder-2",
+# and its handoff filename + worktree line up). Only climb to a brand-new
+# instance when no resurrectable slot exists or all prior instances are alive.
 _next_free_instance() {
   local squad_dir="$1"
   local role="$2"
-  local taken
-  taken=$(
-    {
-      tmux list-panes -t "$SQUAD_SESSION" \
-        -F '#{@agent_role} #{@agent_instance}' 2>/dev/null \
-        | awk -v r="$role" '$1==r {print $2}'
-      jq -r --arg role "$role" '
-        .agents[] | select(.role == $role) | .instance
-      ' "${squad_dir}/session.json" 2>/dev/null
-    } | sort -un
-  )
+
+  # Instances currently alive in tmux for this role.
+  local alive
+  alive=$(tmux list-panes -t "$SQUAD_SESSION" \
+    -F '#{@agent_role} #{@agent_instance}' 2>/dev/null \
+    | awk -v r="$role" '$1==r {print $2}' | sort -un)
+
+  # Lowest killed/vanished instance whose number isn't currently alive.
+  local resurrectable
+  resurrectable=$(jq -r --arg role "$role" '
+    .agents
+    | map(select(.role == $role and (.status == "killed" or .status == "vanished")))
+    | sort_by(.instance) | .[0].instance // empty
+  ' "${squad_dir}/session.json" 2>/dev/null)
+  if [[ -n "$resurrectable" ]] && ! echo "$alive" | grep -qx "$resurrectable"; then
+    echo "$resurrectable"
+    return
+  fi
+
+  # No resurrectable slot — climb to the next unused number.
   local i=1
-  while echo "$taken" | grep -qx "$i"; do
+  while echo "$alive" | grep -qx "$i"; do
     i=$((i + 1))
   done
   echo "$i"

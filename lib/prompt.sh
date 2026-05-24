@@ -46,17 +46,11 @@ jq '.agents' ${squad_dir}/session.json            # full registry (history + sta
 Re-check before sending mailbox messages so you address the right peer.
 HEREDOC
 
-  # Resume preamble if a handoff from a prior instance exists
-  if [[ -f "${squad_dir}/handoff-${name}.md" ]]; then
-    cat >> "$prompt_file" << HEREDOC
-
-## Resumption Context
-You are resuming role ${name} after a prior instance was closed.
-Before doing anything else, read ${squad_dir}/handoff-${name}.md — it contains
-the previous instance's final state, next intended action, and any blockers.
-Treat it as authoritative for what's already been done.
-HEREDOC
-  fi
+  # NOTE: We intentionally do NOT auto-inject a resume preamble even when a
+  # prior handoff file exists. The harness provides the mechanism (handoff
+  # files persist across kill/spawn); whoever invokes the spawn (usually the
+  # planner) decides whether and how to brief the new instance about it.
+  # See PLAN.md "Design intent" and memory feedback-harness-provides-mechanisms-not-policies.
 
   # Sprint file reference if provided
   if [[ -n "$sprint_file" ]] && [[ -f "$sprint_file" ]]; then
@@ -93,20 +87,33 @@ HEREDOC
 }
 
 # Dynamic-mode launcher generator. Pairs with squad_prompt_generate_dynamic.
-# Usage: squad_prompt_launcher_dynamic <squad_dir> <name> <work_dir> [model]
+# Usage: squad_prompt_launcher_dynamic <squad_dir> <name> <work_dir> [model] [session_id] [resume]
+#   session_id: claude UUID for this agent (fresh spawn assigns one; resume reuses it)
+#   resume:     "1" to use --resume, anything else / unset for --session-id (fresh)
 squad_prompt_launcher_dynamic() {
   local squad_dir="$1"
   local name="$2"
   local work_dir="$3"
   local model="${4:-claude-opus-4-6}"
+  local session_id="${5:-}"
+  local resume="${6:-0}"
   local prompt_file="${squad_dir}/prompt-${name}.md"
   local launch_file="${squad_dir}/launch-${name}.sh"
+
+  local session_flag=""
+  if [[ -n "$session_id" ]]; then
+    if [[ "$resume" == "1" ]]; then
+      session_flag="--resume \"${session_id}\""
+    else
+      session_flag="--session-id \"${session_id}\""
+    fi
+  fi
 
   cat > "$launch_file" << HEREDOC
 #!/usr/bin/env bash
 # Auto-generated launcher for ${name} agent
 cd "${work_dir}"
-exec claude --dangerously-skip-permissions --append-system-prompt-file "${prompt_file}" --model "${model}"
+exec claude --dangerously-skip-permissions --append-system-prompt-file "${prompt_file}" --model "${model}" ${session_flag}
 HEREDOC
 
   chmod +x "$launch_file"
