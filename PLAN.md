@@ -172,48 +172,68 @@ The harness does not interpret these numbers. The planner reads them whenever it
 
 ---
 
-### Story 6 — Vertical-slice sprint template + interactive planner workflow
+### Story 6 — Vertical-slice sprint template + `planning-sprints` skill
 
-**What ships:** `templates/sprint.md` fully rewritten to the vertical-slice schema (Title, User-observable outcome, Acceptance criteria, Out of scope, Builds on, inline Coder notes / Test results, status `[PENDING|CURRENT|TESTING|DONE|BLOCKED|USER_OVERRIDE]`). `roles/planner.md` workflow rewritten: interactive-first dialogue with you to refine stories one at a time, then write `.squad/spec.md` only when you say "looks good," never auto-spawn (wait for "go"/"start"/"spawn"), mid-flight revision updates `.squad/spec.md` in place with `[REVISED]` markers. `roles/coder.md` workflow rewritten to Explore → Plan → Implement → Verify with a `notification` broadcast at the Plan phase so peers see intent.
+**What ships:**
+
+- **`templates/sprint.md`** fully rewritten to the vertical-slice schema. Each story has: title (user-observable behavior), "what the user can do after this story ships" paragraph, acceptance criteria (observable, not implementation), out-of-scope list, builds-on note, inline Coder notes, inline Test results, inline Bugs section. Status enum `[PENDING|CURRENT|TESTING|DONE|BLOCKED|USER_OVERRIDE]`. The Bugs section format lets any agent (especially the tester) file bugs directly into the sprint file as work progresses.
+- **`skills/planning-sprints/SKILL.md`** — the planner's "how to do the work" skill. Covers: interactive dialogue with the user, vertical-slice story shape (with worked good/bad examples), choosing which agent to wake first (coder for features, tester for bugs), briefing them well, revising mid-flight with `[REVISED]` markers, recycling agents whose context is heavy or whose next task is semantically unrelated. Frontmatter description is "pushy" per Anthropic's skill-writing guidance so the skill auto-triggers when relevant.
+- **`roles/planner.md` shrinks to ~25 lines.** Just identity ("you are the planner, singleton, user's primary collaborator"), mechanism pointers (sprint file, mailbox, roster, spawn/kill/recycle/usage CLIs), and a note pointing at the `planning-sprints` skill. All workflow knowledge moved into the skill.
+- **`install.sh`** symlinks `skills/*/` directories into `~/.claude/skills/` so spawned agents discover them automatically.
 
 **Demo after this story:**
-- `squad start`, ask planner to plan a "minimal kanban board."
-- Planner proposes Story 1: "user sees an empty board with a single Add Card button." You push back: "actually start with two columns visible." Planner revises and re-proposes.
-- Iterate until you're happy across ~3 stories, then "looks good" → spec written.
-- "go" → planner spawns coder, hands off Story 1 (deliverable behavior + acceptance + out-of-scope, NOT filenames or libraries).
-- Coder explores, broadcasts plan, implements, marks `[TESTING]`.
-- Mid-implementation you change your mind: "actually make the columns horizontal not vertical." Planner sends `redirect` to coder, updates `.squad/spec.md` with `[REVISED]`.
+- `bash install.sh` once → confirms `planning-sprints` shows up at `~/.claude/skills/planning-sprints`.
+- `squad start` in a scratch repo.
+- Tell planner: "I want to build a minimal kanban board." It should invoke the `planning-sprints` skill (you'll see it propose Story 1 conversationally, not write the spec file yet).
+- Push back on Story 1 ("start with two columns visible"), planner revises.
+- Say "looks good" through ~3 stories, then "go" → planner writes `.squad/spec.md` and `squad spawn coder`s.
+- Type into planner pane: "actually make the columns horizontal." Planner updates the affected story with `[REVISED <date>]` markers and notifies the coder.
+- Recycle test: ask planner to `squad recycle coder --reason "test"` and confirm same Claude session resumes (from Story 4 mechanism).
 
-**Out of scope this story:** tester MCP changes, reviewer.
+**Out of scope this story:** tester MCP work (Story 7), coder skill (Story 8), reviewer (deferred).
 
 ---
 
-### Story 7 — Tester uses MCP Playwright (hybrid: agentic exploration + durable spec files)
+### Story 7 — `testing-stories` skill that leans on `playwright-bowser`
 
-**What ships:** `roles/tester.md` workflow rewritten. The old raw-Playwright-CLI section is deleted. New protocol: navigate via `mcp__playwright__browser_navigate`, snapshot via `browser_snapshot` to get semantic refs, drive via `browser_click` / `browser_fill_form` / `browser_type` on refs (DOM-change-resilient), screenshot at each verification point. For each story: happy path + one edge case + one failure mode (no more, no less). For passing flows, encode as a durable `tests/sprint-{N}-story-{M}.spec.ts` regression artifact. Tester can `clarify` directly to coder (no planner middleman). Tester can `request_spawn reviewer` if it sees architecture/security issues outside its scope.
+**What ships:**
+
+- **`skills/testing-stories/SKILL.md`** — the tester's craft. Covers: reading acceptance criteria from the sprint file, three-mode coverage discipline (happy + edge + failure per story, no more no less), filing bugs inline into the sprint file's per-story Bugs section, encoding passing flows as durable `tests/sprint-N-story-M.spec.ts` regression artifacts, escalating to a reviewer for out-of-scope quality concerns. Pushy frontmatter so it triggers when relevant.
+- **Delegates browser driving to `playwright-bowser`.** Instead of teaching the tester `npx playwright` or raw MCP calls, the skill points at the pre-existing `playwright-bowser` skill, which already provides token-efficient CLI access, named parallel sessions, ref-based interaction (DOM-change-resilient), and proper cleanup. Two skills compose: `testing-stories` knows *what* and *how to report*; `playwright-bowser` knows *how to drive a browser*.
+- **`roles/tester.md` shrinks to ~25 lines.** Identity + mechanism pointers + a note pointing at both skills. The old GAN-rubric scoring + raw Playwright CLI sections are removed.
+- **`install.sh`** already symlinks all `skills/*/` so `testing-stories` is picked up automatically alongside `planning-sprints`.
 
 **Demo after this story:**
-- Run Story 7's demo through the full kanban Story 1 + Story 2 lifecycle.
-- Watch tester: snapshots the running app, drives clicks on refs, takes screenshots, scores against the acceptance criteria from the sprint file.
-- After a passing story, check that `tests/sprint-1-story-1.spec.ts` exists and `npx playwright test` runs it green.
-- Force a failure (change a button's accessible name) and rerun → tester still drives via ref-by-name and reports a clear bug with screenshot evidence.
+- Continue Story 6's kanban demo: planner has spawned coder, coder has marked Story 1 `[TESTING]`.
+- Planner spawns tester (or coder asks for tester directly).
+- Tester triggers `testing-stories`, reads Story 1, walks through happy + edge + failure modes using `playwright-bowser` (snapshot → ref → click → fill → screenshot).
+- Tester appends test results + any bugs inline under Story 1 in the sprint file.
+- If passing: tester generates `tests/sprint-1-story-1.spec.ts` and runs `npx playwright test` to confirm it's green.
+- Tester messages the coder directly with a `result` mailbox event — no planner middleman.
 
-**Out of scope this story:** reviewer behavior changes.
+**Out of scope this story:** the coder skill (Story 8); reviewer (deferred).
 
 ---
 
-### Story 8 — Reviewer role: on-demand spawn, self-close protocol
+### Story 8 — `coding-stories` skill
 
-**What ships:** `roles/reviewer.md` updated. Reviewer is no longer in the default roster; it only exists because some peer sent `request_spawn reviewer` to the planner. Reviewer reads the originating request's body to learn scope, reviews the diff, delivers findings as a `result` message, then either `request_close self` (no follow-up needed) or `request_keep_alive coder` (critical fixes needed). Section 0 + handoff discipline as in other roles.
+**What ships:**
+
+- **`skills/coding-stories/SKILL.md`** — the coder's craft. Covers: understanding the story before writing (read sprint file + planner pointers + CLAUDE.md + relevant code), writing real code (no stubs, no placeholders, no scope sprawl), self-reviewing the diff before handing off, clean commits, handing off directly to the tester via mailbox. Also covers handling user redirects mid-flight (small ones the coder updates the sprint file for with `[REVISED]` markers; bigger ones go to the planner via `redirect` mailbox), fixing bugs filed by the tester, and resuming cleanly from a handoff file after recycle. Pushy frontmatter description so the skill triggers when the coder picks up work.
+- **No internal loop.** The skill explicitly states the coder is not a loop. It finishes its piece (one story or one bug fix), hands off, stops. Whether work bounces back to the same coder or to a fresh one is the planner's decision, made outside the coder per situation.
+- **`roles/coder.md` shrinks to ~25 lines.** Identity ("you implement one piece of work at a time, you're not the orchestrator"), mechanism pointers (sprint file, mailbox, handoff file), and a note pointing at the `coding-stories` skill. The old GAN context-reset protocol and the obsolete "don't tmux-notify the tester mid-test" rule are gone.
+- **`install.sh`** symlinks `coding-stories` automatically alongside the other two; verified live in the skill registry.
+
+**Reviewer left as-is for now.** The reviewer role is spawned on-demand and the planner briefs it dynamically per Story 5's free-peer-collab model. A dedicated `reviewing-diffs` skill can come later when a clear pattern emerges — that matches the "future improvements go in skills" principle in the Design Intent section. Reviewer role file stays in the old shape until then.
 
 **Demo after this story:**
-- Run Story 7's demo. After a story passes tester, ask tester (via direct prompt) to escalate: "the auth code feels brittle, ask for a reviewer."
-- Tester sends `request_spawn reviewer` with scope (file paths from coder's notes).
-- Reviewer spawns, reads scope from the request body, posts findings to mailbox as `result`.
-- Reviewer self-closes via `request_close self`; planner arbitrates and acks; reviewer's pane disappears.
-- If critical issues found, reviewer instead sends `request_keep_alive coder` and coder stays alive to fix.
+- Continue Stories 6+7's kanban demo: planner has spawned coder + tester. Coder triggers `coding-stories` on receiving Story 1's brief, implements, self-reviews, hands to tester.
+- Tester finds a bug, files it inline in the sprint file's Bugs section, messages coder.
+- Coder reads the bug, fixes, marks `[FIXED]`, messages tester back.
+- Mid-implementation: type into coder's pane "actually use Zustand, not Redux." Coder pivots without ceremony, updates Story 1's coder notes with the change.
+- Bigger redirect: type "we don't need password login at all — magic links only." Coder sends `redirect` to planner; planner updates affected stories in `.squad/spec.md` with `[REVISED]` markers.
 
-**Out of scope this story:** nothing — this is the last story.
+**Out of scope this story:** reviewer skill (deferred — invoke on-demand for now); fluent prompts ("how to add a skill" type docs) for future skill authors.
 
 ---
 

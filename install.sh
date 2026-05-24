@@ -95,6 +95,25 @@ fi
 
 mkdir -p "${HOME}/.claude-squad"
 
+# ─── Symlink skills into ~/.claude/skills/ ──────────────────────
+
+if [[ -d "${SQUAD_DIR}/skills" ]]; then
+  mkdir -p "${HOME}/.claude/skills"
+  echo ""
+  echo "Linking claude-squad skills into ~/.claude/skills/..."
+  for skill_dir in "${SQUAD_DIR}/skills"/*/; do
+    [[ -d "$skill_dir" ]] || continue
+    skill_name=$(basename "$skill_dir")
+    target="${HOME}/.claude/skills/${skill_name}"
+    if [[ -L "$target" ]] || [[ ! -e "$target" ]]; then
+      ln -sfn "$skill_dir" "$target"
+      printf "  %-24s -> %s\n" "$skill_name" "$skill_dir"
+    else
+      printf "  %-24s SKIPPED (a non-symlink already exists at %s)\n" "$skill_name" "$target"
+    fi
+  done
+fi
+
 echo ""
 echo "Installation complete!"
 echo ""
@@ -103,7 +122,7 @@ echo "Then run:           squad --help"
 echo ""
 echo "Quick start:"
 echo "  cd /your/project"
-echo "  squad start                              # coder + tester"
-echo "  squad start --roles planner,coder,tester # full harness"
-echo "  squad harness \"Build a todo app\"         # headless mode"
+echo "  squad start                              # planner-only; spawn peers from there"
+echo "  squad start --static coder,tester        # legacy fixed roster"
+echo "  squad harness \"Build a todo app\"         # headless GAN loop"
 echo ""

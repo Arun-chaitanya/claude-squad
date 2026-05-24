@@ -1,68 +1,93 @@
-# Sprint Plan
+# Sprint
 
-> Replace this template with your project details.
-> Launch with: `squad start sprints/my-feature.md`
+> This is the shared source of truth. The planner drafts it, the coder reads
+> stories from it and adds notes, the tester writes results and files bugs
+> into it. Any agent (and you) can read or write any section.
+>
+> Launch with: `squad start path/to/this/file.md`
 
-## Overview
+## What we're building
 
-[1-2 sentences describing what you're building]
+[1-2 sentences. The planner fills this in after talking with the user. It
+should describe the user-observable outcome of the whole sprint — not the
+implementation.]
 
-## Design Language
+## Constraints / pointers from the user
 
-- Colors: primary=#2563eb, secondary=#1e293b, accent=#f59e0b, bg=#f8fafc, text=#0f172a
-- Typography: Inter/system-ui, headings 24/20/16px, body 14px
-- Spacing: base 4px, section gap 32px
-- Style: rounded-lg corners, subtle shadows, 1px borders
+[Anything specific the user mentioned: files to read, libraries to use or
+avoid, conventions to follow, deadlines, prior decisions. The planner
+captures verbatim quotes here when ambiguity matters.]
 
-## Sprint 1: Project Setup & Core Layout
+---
+
+## Story 1: [Title — phrase as user-observable behavior]
+
 Status: [CURRENT]
 
-### Deliverables
-- [ ] Initialize project (framework, dependencies, config)
-- [ ] Build main layout shell (header, sidebar, content area)
-- [ ] Set up routing between pages
+### What the user can do after this story ships
+[One paragraph. A scenario someone could click through end-to-end. If you
+can't describe it as a user flow, the story is too small or too implementation-shaped.]
 
-### Success Criteria
-- App starts without errors on localhost
-- Navigation between pages works
-- Layout is responsive at 1024px and 1440px widths
+### Acceptance criteria
+- [ ] Criterion 1 (observable, not implementation)
+- [ ] Criterion 2
+- [ ] Criterion 3
+
+### Out of scope for this story
+- Anything intentionally not included (the planner names these explicitly
+  so the coder doesn't sprawl)
+
+### Builds on
+[n/a — entry point | Story N, extends Y]
+
+### Coder notes
+<!-- The coder appends here as work progresses. Decisions made, libraries
+chosen, files touched, anything a future coder (or the tester) needs to know. -->
+
+### Test results
+<!-- The tester appends here. -->
+- Happy path: [PASS | FAIL]
+- Edge case ([what]): [PASS | FAIL]
+- Failure mode ([what]): [PASS | FAIL]
+
+### Bugs
+<!-- Filed by the tester during testing. Any agent can update status. -->
+<!-- Format:
+[B-1] Title — STATUS: [OPEN|FIXED|VERIFIED|WONTFIX]
+  Repro: steps
+  Filed by: <name> at <ts>
+  Fixed by: <name> at <ts>
+-->
 
 ---
 
-## Sprint 2: Core Feature Implementation
+## Story 2: [Title]
+
 Status: [PENDING]
 
-### Deliverables
-- [ ] Implement primary feature
-- [ ] Add data persistence
-- [ ] Wire up API endpoints
-
-### Success Criteria
-- Feature can be used end-to-end
-- Data persists across page refreshes
-- API returns correct responses
-
----
-
-## Sprint 3: Polish & Edge Cases
-Status: [PENDING]
-
-### Deliverables
-- [ ] Error handling and loading states
-- [ ] Keyboard shortcuts
-- [ ] Mobile responsiveness
-
-### Success Criteria
-- No unhandled errors in console
-- All interactive elements accessible via keyboard
-- Usable on 375px width viewport
+### What the user can do after this story ships
+### Acceptance criteria
+- [ ]
+### Out of scope for this story
+### Builds on
+[Story 1, extends Y by adding Z]
+### Coder notes
+### Test results
+### Bugs
 
 ---
 
-## Notes
+<!--
+Status enum:
+  [PENDING]       not started
+  [CURRENT]       coder working on it
+  [TESTING]       handed off to tester
+  [DONE]          tester verified, story complete
+  [BLOCKED]       waiting on something external — agent notes why inline
+  [USER_OVERRIDE] user redirected mid-flight; see [REVISED] markers in body
 
-### Coder Notes
-<!-- The coder writes implementation notes here -->
-
-### Test Results
-<!-- The tester writes evaluation results here -->
+When a story is revised mid-flight (by the user or per peer feedback), edit
+the affected sections in place and append a [REVISED <ts>] marker with a
+one-line note on what changed and why. Don't delete the prior version —
+strikethrough or quote it so history is visible.
+-->
