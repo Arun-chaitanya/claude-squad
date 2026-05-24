@@ -23,6 +23,7 @@ source "${SQUAD_DIR}/lib/harness.sh"
 source "${SQUAD_DIR}/lib/monitor.sh"
 source "${SQUAD_DIR}/lib/prompt.sh"
 source "${SQUAD_DIR}/lib/registry.sh"
+source "${SQUAD_DIR}/lib/archive.sh"
 
 # ─── Defaults ────────────────────────────────────────────────────
 
@@ -41,7 +42,15 @@ USAGE:
 
 COMMANDS:
   start [sprint.md]    Launch a planner-only tmux session (dynamic by default)
-  stop                 Kill the tmux session and clean up
+  stop                 Kill the tmux session and archive the runtime for resume
+                       Flags: [--no-archive] [--nuke-worktrees]
+  resume [name]        Restore the latest archive of <name> and respawn each
+                       agent with their Claude conversation resumed
+                       Flags: [--fresh] [--no-restore-claude]
+  archive list         Show all archived squads in this repo (newest first)
+  archive prune        Delete archives older than the retention window
+                       Flags: [--older-than 30d]
+  archive rm <dir>     Delete a specific archive
   status               Show agent status dashboard
   watch                Live-updating status dashboard
   attach               Attach to the tmux session
@@ -61,6 +70,9 @@ COMMANDS:
                        Claude session unless --fresh). Convenience for the
                        planner when an agent needs a context refresh.
                        Flags: [--reason "..."] [--grace-seconds N] [--fresh]
+  mail <to> <type> <body...>  Send a mailbox message and nudge recipient pane
+  inbox                Show mail addressed to you (or to "all")
+                       Flags: [--since <iso>] [--all] [--name <override>]
   init                 Copy sprint template to ./sprints/
   harness <prompt>     Run headless GAN-style harness (no tmux)
   merge <role>         Merge a role's worktree branch back to main
@@ -82,7 +94,11 @@ EXAMPLES:
   squad start sprints/feature.md           # planner with a sprint file
   squad start --static coder,tester        # legacy fixed roster
   squad start --static planner,coder,tester --worktrees
-  squad list                               # see all squads in this repo
+  squad stop                               # archives runtime to .squad-archive/
+  squad resume                             # resumes the latest 'default' archive
+  squad resume backend                     # resumes the latest 'backend' archive
+  squad archive list                       # see archived squads (within ${SQUAD_ARCHIVE_RETENTION_DAYS:-30}d)
+  squad list                               # see all live squads in this repo
   squad use backend                        # switch current squad
   squad attach --name backend              # attach to a specific squad
   squad harness "Build a todo app"         # headless harness loop
@@ -455,20 +471,54 @@ cmd_stop() {
   local squad_runtime
   squad_runtime=$(_squad_runtime)
 
-  # Clean up worktrees if they exist
-  if [[ -f "${squad_runtime}/session.json" ]]; then
+  # Parse flags AFTER _resolve_squad_name (which already consumed --name).
+  local archive=true
+  local nuke_worktrees=false
+  for arg in "$@"; do
+    case "$arg" in
+      --no-archive) archive=false ;;
+      --nuke-worktrees) nuke_worktrees=true ;;
+    esac
+  done
+
+  # By default we KEEP worktrees on stop — they're a working copy of code and
+  # the user may want them on resume. Pass --nuke-worktrees to discard them
+  # (or use squad_worktree_cleanup directly after).
+  if [[ -f "${squad_runtime}/session.json" ]] && $nuke_worktrees; then
     local session_id use_worktrees
     session_id=$(jq -r '.session_id' "${squad_runtime}/session.json" 2>/dev/null)
     use_worktrees=$(jq -r '.use_worktrees' "${squad_runtime}/session.json" 2>/dev/null)
 
     if [[ "$use_worktrees" == "true" ]] && [[ -n "$session_id" ]]; then
-      echo "Cleaning up worktrees..."
+      echo "Removing worktrees (--nuke-worktrees)..."
       squad_worktree_cleanup "$REPO_PATH" "$session_id"
     fi
   fi
 
   # Kill tmux session
   squad_tmux_kill_session
+
+  # Archive the runtime so the user can `squad resume` later. Skip with
+  # --no-archive (which leaves the runtime dir in place, ready for the next
+  # `squad start` to clobber).
+  if $archive && [[ -d "$squad_runtime" ]] && [[ -f "${squad_runtime}/session.json" ]]; then
+    local archive_path
+    if archive_path=$(squad_archive_stash "$REPO_PATH" "$SQUAD_NAME"); then
+      echo "Archived to ${archive_path}"
+      echo "  → resume with: squad resume ${SQUAD_NAME}"
+    else
+      echo "Warning: failed to archive ${squad_runtime}; left in place" >&2
+    fi
+
+    # Lazy retention: prune anything past the cutoff.
+    local pruned
+    pruned=$(squad_archive_prune "$REPO_PATH")
+    if [[ -n "$pruned" ]]; then
+      local count
+      count=$(printf '%s\n' "$pruned" | wc -l | tr -d ' ')
+      echo "Pruned ${count} archive(s) older than ${SQUAD_ARCHIVE_RETENTION_DAYS}d"
+    fi
+  fi
 
   # If we just stopped the squad recorded in .squad/current, clear the pointer
   # so subsequent commands don't try to target a dead squad.
@@ -1069,9 +1119,6 @@ cmd_usage() {
     }'
 }
 
-# squad recycle <name> [--reason "..."] [--grace-seconds N] [--fresh]
-# Convenience: kill <name> then spawn the same role + instance again. The
-# default behavior preserves the Claude session (--resume) and worktree, so
 # Send a message to another agent and nudge their pane.
 # Sender is taken from $SQUAD_AGENT_NAME (exported into each pane by the launcher).
 # Recipient is resolved against the live registry; `all` broadcasts to every
@@ -1170,6 +1217,251 @@ cmd_inbox() {
   fi
 
   jq -c --arg me "$who" --arg since "$since" "$filter" "$mailbox"
+}
+
+# squad resume [name] [--fresh] [--no-restore-claude]
+# Restore the most recent archive matching <name> (default: "default") and
+# respawn each previously-alive agent with --resume on their original Claude
+# session id. Refuses if a live squad with the target name already exists.
+#
+# Flags:
+#   --fresh               start each agent with a fresh Claude conversation
+#                         (handoff files archived) — useful if the prior
+#                         context is stale.
+#   --no-restore-claude   don't pass --resume to Claude; still respawn the
+#                         topology and pick up handoff files. Lighter weight
+#                         than --fresh (handoffs preserved, just no chat).
+cmd_resume() {
+  local name=""
+  local fresh=false
+  local restore_claude=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fresh)              fresh=true; shift ;;
+      --no-restore-claude)  restore_claude=false; shift ;;
+      --name)               name="$2"; shift 2 ;;  # alias for positional
+      -*)                   echo "Unknown option: $1" >&2; exit 1 ;;
+      *)                    name="$1"; shift ;;
+    esac
+  done
+  [[ -z "$name" ]] && name="default"
+
+  local archive_dir
+  if ! archive_dir=$(squad_archive_latest "$REPO_PATH" "$name"); then
+    echo "Error: no archive matching '${name}' in $(squad_archive_dir "$REPO_PATH")" >&2
+    echo "       Run 'squad archive list' to see what's available." >&2
+    exit 1
+  fi
+
+  # Resolve target name (an archive's meta.json holds the original squad name,
+  # which is what we restore to — not the timestamped archive basename).
+  local target_name
+  target_name=$(jq -r '.name' "${archive_dir}/meta.json" 2>/dev/null)
+  [[ -z "$target_name" || "$target_name" == "null" ]] && target_name="$name"
+
+  # Refuse if a live squad with that name already exists.
+  if [[ -d "${REPO_PATH}/.squad/${target_name}" ]] || \
+     tmux has-session -t "claude-squad-${target_name}" 2>/dev/null; then
+    echo "Error: squad '${target_name}' is already active." >&2
+    echo "       Run 'squad stop --name ${target_name}' first, then resume." >&2
+    exit 1
+  fi
+
+  echo "Resuming squad '${target_name}' from ${archive_dir}"
+  echo "  archived at: $(jq -r '.archived_at' "${archive_dir}/meta.json" 2>/dev/null)"
+
+  # Lazy retention prune while we're here.
+  squad_archive_prune "$REPO_PATH" >/dev/null
+
+  local squad_runtime
+  squad_runtime=$(squad_archive_restore "$REPO_PATH" "$archive_dir" "$target_name") || exit 1
+
+  # Make the resumed squad the current one for subsequent commands.
+  SQUAD_NAME="$target_name"
+  export SQUAD_NAME
+  squad_tmux_set_session_name
+  mkdir -p "${REPO_PATH}/.squad"
+  printf '%s\n' "$SQUAD_NAME" > "${REPO_PATH}/.squad/current"
+
+  # Snapshot the previously-alive roster BEFORE we mutate anything. Order:
+  # planner first, then everyone else, so the spawn helpers can split off
+  # planner's pane.
+  local roster_json
+  roster_json=$(jq -c '
+    [.agents[] | select(.status == "alive")]
+    | sort_by(if .role == "planner" then 0 else 1 end, .instance)
+  ' "${squad_runtime}/session.json")
+
+  local prev_count
+  prev_count=$(echo "$roster_json" | jq 'length')
+  if [[ "$prev_count" == "0" ]]; then
+    echo "Warning: archive had no alive agents; restoring runtime only (no tmux session)" >&2
+    return 0
+  fi
+
+  # Mark every prior-alive entry as 'archived' so the registry is clean;
+  # spawning each agent below will add a fresh alive row.
+  local tmp="${squad_runtime}/session.json.tmp"
+  jq '.agents |= map(if .status == "alive" then .status = "archived" else . end)' \
+    "${squad_runtime}/session.json" > "$tmp" && mv "$tmp" "${squad_runtime}/session.json"
+
+  local session_id session_model session_use_wt session_sprint
+  session_id=$(jq -r '.session_id' "${squad_runtime}/session.json")
+  session_model=$(jq -r '.model' "${squad_runtime}/session.json")
+  session_use_wt=$(jq -r '.use_worktrees' "${squad_runtime}/session.json")
+  session_sprint=$(jq -r '.sprint_file // ""' "${squad_runtime}/session.json")
+
+  # First agent: re-create the tmux session anchored on it. We bypass the
+  # high-level cmd_spawn and replicate its plumbing so we can target either
+  # `squad_tmux_create_single_pane` (first agent) or `squad_tmux_spawn`
+  # (subsequent agents) as needed.
+  local i=0
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+
+    local role instance name pane_id wt_path agent_model claude_sid
+    role=$(echo "$agent" | jq -r '.role')
+    instance=$(echo "$agent" | jq -r '.instance')
+    name=$(echo "$agent" | jq -r '.name')
+    wt_path=$(echo "$agent" | jq -r '.worktree_path // ""')
+    agent_model=$(echo "$agent" | jq -r ".model // \"${session_model}\"")
+    claude_sid=$(echo "$agent" | jq -r '.claude_session_id // ""')
+
+    local work_dir="$REPO_PATH"
+    if [[ -n "$wt_path" && -d "$wt_path" ]]; then
+      work_dir="$wt_path"
+    elif [[ -n "$wt_path" ]]; then
+      echo "  Warning: ${name}'s worktree ${wt_path} is missing; falling back to repo root" >&2
+      wt_path=""
+    fi
+
+    # --fresh: archive the prior handoff so the agent starts blank, and
+    # generate a brand new Claude session.
+    if $fresh && [[ -f "${squad_runtime}/handoff-${name}.md" ]]; then
+      local ts
+      ts=$(date -u +%s)
+      mv "${squad_runtime}/handoff-${name}.md" "${squad_runtime}/handoff-${name}.archived-${ts}.md"
+    fi
+
+    local resume_flag="0"
+    if $restore_claude && ! $fresh && [[ -n "$claude_sid" && "$claude_sid" != "null" ]]; then
+      resume_flag="1"
+    else
+      claude_sid=$(uuidgen | tr 'A-Z' 'a-z')
+    fi
+
+    squad_prompt_generate_dynamic "$squad_runtime" "$name" "$role" "$work_dir" "$session_sprint" >/dev/null
+    squad_prompt_launcher_dynamic "$squad_runtime" "$name" "$work_dir" "$agent_model" "$claude_sid" "$resume_flag" >/dev/null
+
+    if [[ "$i" == "0" ]]; then
+      pane_id=$(squad_tmux_create_single_pane "$role" "$instance")
+      squad_tmux_launch_pane "$pane_id" "bash ${squad_runtime}/launch-${name}.sh"
+    else
+      pane_id=$(squad_tmux_spawn "$role" "$instance" "bash ${squad_runtime}/launch-${name}.sh")
+    fi
+
+    # Replace the old archived row (or add a fresh one if none existed).
+    squad_registry_remove "$squad_runtime" "$name"
+    local agent_json
+    agent_json=$(jq -n \
+      --arg role "$role" --argjson instance "$instance" --arg name "$name" \
+      --arg pane_id "$pane_id" --arg wt "$wt_path" --arg model "$agent_model" \
+      --arg claude_sid "$claude_sid" \
+      --arg spawned_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+      '{role:$role, instance:$instance, name:$name, pane_id:$pane_id,
+        worktree_path:$wt, model:$model, claude_session_id:$claude_sid,
+        spawned_at:$spawned_at, status:"alive"}')
+    squad_registry_add "$squad_runtime" "$agent_json"
+
+    echo "  Resumed ${name} (${pane_id}) in ${work_dir}"
+    i=$((i + 1))
+  done < <(echo "$roster_json" | jq -c '.[]')
+
+  squad_mailbox_send "$squad_runtime" "system" "all" "squad_resumed" \
+    "{\"squad\":\"${target_name}\",\"agents\":${prev_count},\"archived_at\":\"$(jq -r '.archived_at' "${squad_runtime}/meta.json" 2>/dev/null || echo unknown)\"}"
+
+  echo ""
+  echo "Squad '${target_name}' resumed with ${prev_count} agent(s)."
+  echo "Run 'squad attach' to jump into the session."
+}
+
+# squad archive <subcommand>
+#   list                          show all archived squads (newest first)
+#   prune [--older-than 30d]      delete archives older than N days
+#   rm <archive-dir>              delete a specific archive
+cmd_archive() {
+  local sub="${1:-list}"
+  shift 2>/dev/null || true
+
+  case "$sub" in
+    list|ls)
+      _cmd_archive_list "$@"
+      ;;
+    prune|gc)
+      local days="$SQUAD_ARCHIVE_RETENTION_DAYS"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --older-than)
+            # Accept "30d", "30", "720h" — we only honor days for now.
+            days="${2%d}"
+            days="${days%h}"
+            shift 2
+            ;;
+          *) shift ;;
+        esac
+      done
+      local pruned
+      pruned=$(squad_archive_prune "$REPO_PATH" "$days")
+      if [[ -z "$pruned" ]]; then
+        echo "Nothing to prune (cutoff: ${days}d)."
+      else
+        local count
+        count=$(printf '%s\n' "$pruned" | wc -l | tr -d ' ')
+        echo "Pruned ${count} archive(s) older than ${days}d:"
+        printf '  %s\n' $pruned
+      fi
+      ;;
+    rm|remove)
+      local target="${1:-}"
+      if [[ -z "$target" ]]; then
+        echo "Usage: squad archive rm <archive-dir-or-basename>" >&2
+        exit 1
+      fi
+      local arch_root
+      arch_root=$(squad_archive_dir "$REPO_PATH")
+      # Allow either a full path or a basename inside .squad-archive/
+      local full="$target"
+      [[ -d "$target" ]] || full="${arch_root}/${target}"
+      if [[ ! -d "$full" ]]; then
+        echo "Error: archive not found: ${target}" >&2
+        exit 1
+      fi
+      rm -rf "$full"
+      echo "Removed ${full}"
+      ;;
+    *)
+      echo "Usage: squad archive {list|prune|rm}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+_cmd_archive_list() {
+  local rows
+  rows=$(squad_archive_list "$REPO_PATH")
+  if [[ -z "$rows" ]]; then
+    echo "No archives in $(squad_archive_dir "$REPO_PATH")"
+    return 0
+  fi
+  printf '%-20s  %-22s  %-8s  %-6s  %s\n' "NAME" "ARCHIVED" "AGE" "AGENTS" "DESCRIPTION"
+  printf '%-20s  %-22s  %-8s  %-6s  %s\n' "----" "--------" "---" "------" "-----------"
+  local dir name archived age agents desc
+  while IFS=$'\t' read -r dir name archived age agents desc; do
+    printf '%-20s  %-22s  %-8s  %-6s  %s\n' "$name" "$archived" "$age" "$agents" "${desc:--}"
+  done <<< "$rows"
+  echo ""
+  echo "Resume the latest archive of a squad: squad resume <name>"
+  echo "Retention: archives older than ${SQUAD_ARCHIVE_RETENTION_DAYS}d are auto-pruned."
 }
 
 # this is a "context refresh after fatigue" verb. Pass --fresh to start with
@@ -1300,6 +1592,8 @@ main() {
     recycle)  cmd_recycle "$@" ;;
     mail)     cmd_mail "$@" ;;
     inbox)    cmd_inbox "$@" ;;
+    resume)   cmd_resume "$@" ;;
+    archive)  cmd_archive "$@" ;;
     init)     cmd_init ;;
     harness)  cmd_harness "$@" ;;
     merge)    cmd_merge "$@" ;;
