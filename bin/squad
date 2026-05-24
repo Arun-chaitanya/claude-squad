@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  Claude Squad — Multi-Agent Development Harness              ║
+# ║  GAN-style Planner → Generator → Evaluator orchestration     ║
+# ║  using tmux + Claude Code + Playwright                       ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+SQUAD_VERSION="1.0.0"
+SQUAD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Source libraries
+source "${SQUAD_DIR}/lib/tmux.sh"
+source "${SQUAD_DIR}/lib/mailbox.sh"
+source "${SQUAD_DIR}/lib/worktree.sh"
+source "${SQUAD_DIR}/lib/harness.sh"
+source "${SQUAD_DIR}/lib/monitor.sh"
+source "${SQUAD_DIR}/lib/prompt.sh"
+source "${SQUAD_DIR}/lib/registry.sh"
+
+# ─── Defaults ────────────────────────────────────────────────────
+
+# Legacy fixed-roster boot uses these when --static is passed.
+DEFAULT_STATIC_ROLES="coder,tester"
+REPO_PATH="$(pwd)"
+
+# ─── Helpers ─────────────────────────────────────────────────────
+
+usage() {
+  cat << 'EOF'
+Claude Squad — Multi-Agent Development Harness
+
+USAGE:
+  squad <command> [options]
+
+COMMANDS:
+  start [sprint.md]    Launch a planner-only tmux session (dynamic by default)
+  stop                 Kill the tmux session and clean up
+  status               Show agent status dashboard
+  watch                Live-updating status dashboard
+  attach               Attach to the tmux session
+  roles                List available roles
+  init                 Copy sprint template to ./sprints/
+  harness <prompt>     Run headless GAN-style harness (no tmux)
+  merge <role>         Merge a role's worktree branch back to main
+
+OPTIONS:
+  --static <r1,r2,...> Legacy fixed-roster boot (default: coder,tester).
+                       Without this flag, squad start boots only the planner;
+                       additional agents are spawned at runtime.
+  --repo <path>        Target repository (default: current directory)
+  --worktrees          Use git worktrees for agent isolation
+  --model <model>      Model to use (default: claude-opus-4-6)
+
+EXAMPLES:
+  squad start                              # planner-only dynamic boot
+  squad start sprints/feature.md           # planner with a sprint file
+  squad start --static coder,tester        # legacy fixed roster
+  squad start --static planner,coder,tester --worktrees
+  squad harness "Build a todo app"         # headless harness loop
+  squad status                             # check agent progress
+  squad attach                             # jump into tmux session
+
+EOF
+}
+
+generate_session_id() {
+  date +%s | shasum | head -c 8
+}
+
+validate_role() {
+  local role="${1:-}"
+  [[ -f "${SQUAD_DIR}/roles/${role}.md" ]]
+}
+
+# ─── Commands ────────────────────────────────────────────────────
+
+cmd_start() {
+  local sprint_file=""
+  local static_roles=""
+  local use_worktrees=false
+  local model="claude-opus-4-6"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --static)
+        static_roles="$2"
+        shift 2
+        ;;
+      --roles)
+        # Legacy alias for --static, preserved for any existing scripts/docs.
+        static_roles="$2"
+        shift 2
+        ;;
+      --repo)
+        REPO_PATH="$(cd "$2" && pwd)"
+        shift 2
+        ;;
+      --worktrees)
+        use_worktrees=true
+        shift
+        ;;
+      --model)
+        model="$2"
+        shift 2
+        ;;
+      -*)
+        echo "Unknown option: $1" >&2
+        exit 1
+        ;;
+      *)
+        sprint_file="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -n "$sprint_file" ]] && [[ ! -f "$sprint_file" ]]; then
+    echo "Error: sprint file not found: $sprint_file" >&2
+    exit 1
+  fi
+  if [[ -n "$sprint_file" ]]; then
+    sprint_file="$(cd "$(dirname "$sprint_file")" && pwd)/$(basename "$sprint_file")"
+  fi
+
+  if tmux has-session -t "$SQUAD_SESSION" 2>/dev/null; then
+    echo "Error: session '$SQUAD_SESSION' already exists. Run 'squad stop' first." >&2
+    exit 1
+  fi
+
+  if [[ -n "$static_roles" ]]; then
+    _cmd_start_static "$sprint_file" "$static_roles" "$use_worktrees" "$model"
+  else
+    _cmd_start_dynamic "$sprint_file" "$use_worktrees" "$model"
+  fi
+}
+
+# Default boot: a single planner pane. Additional agents spawn at runtime.
+_cmd_start_dynamic() {
+  local sprint_file="$1"
+  local use_worktrees="$2"
+  local model="$3"
+
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║  Claude Squad v${SQUAD_VERSION}                               ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+  echo "Mode:       dynamic (planner-only boot; spawn peers with 'squad spawn <role>')"
+  echo "Repo:       $REPO_PATH"
+  echo "Sprint:     ${sprint_file:-none}"
+  echo "Worktrees:  $use_worktrees"
+  echo "Model:      $model"
+  echo ""
+
+  local squad_runtime="${REPO_PATH}/.squad"
+  mkdir -p "$squad_runtime"
+
+  local session_id
+  session_id=$(generate_session_id)
+
+  squad_registry_init "$squad_runtime" "$session_id" "$REPO_PATH" "$model" "$sprint_file" "$use_worktrees" >/dev/null
+  squad_mailbox_init "$squad_runtime" >/dev/null
+
+  local planner_workdir="$REPO_PATH"
+  local planner_wt=""
+  if [[ "$use_worktrees" == "true" ]]; then
+    echo "Creating worktree for planner..."
+    planner_wt=$(squad_worktree_create "$REPO_PATH" "planner" "$session_id")
+    if [[ -n "$planner_wt" ]] && [[ -d "$planner_wt" ]]; then
+      planner_workdir="$planner_wt"
+      echo "  planner → $planner_wt"
+      echo ""
+    else
+      echo "  Warning: failed to create worktree for planner" >&2
+    fi
+  fi
+
+  echo "Generating planner prompt..."
+  squad_prompt_generate_dynamic "$squad_runtime" "planner" "planner" "$planner_workdir" "$sprint_file" >/dev/null
+  squad_prompt_launcher_dynamic "$squad_runtime" "planner" "$planner_workdir" "$model" >/dev/null
+  echo "  Wrote prompt-planner.md and launch-planner.sh"
+  echo ""
+
+  echo "Creating tmux session..."
+  local pane_id
+  pane_id=$(squad_tmux_create_single_pane "planner" 1)
+  echo "  planner pane: $pane_id"
+  echo ""
+
+  local agent_json
+  agent_json=$(jq -n \
+    --arg role "planner" --argjson instance 1 --arg name "planner" \
+    --arg pane_id "$pane_id" --arg wt "$planner_wt" --arg model "$model" \
+    --arg spawned_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    '{role:$role, instance:$instance, name:$name, pane_id:$pane_id,
+      worktree_path:$wt, model:$model, spawned_at:$spawned_at, status:"alive"}')
+  squad_registry_add "$squad_runtime" "$agent_json"
+
+  echo "Launching planner..."
+  squad_tmux_launch_pane "$pane_id" "bash ${squad_runtime}/launch-planner.sh"
+  echo "  planner launched"
+  echo ""
+
+  echo "Waiting for Claude Code to initialize..."
+  sleep 8
+
+  local kickoff
+  kickoff="Hi — you are the planner. The user is here and ready to chat. Greet them in one sentence and ask what they want to build. Do NOT write any spec, do NOT spawn any other agents yet. Just have an interactive conversation. When the user explicitly says 'go' or 'start' (later in the chat), you'll then plan and hand off."
+  squad_tmux_send_pane "$pane_id" "$kickoff"
+  echo "  Kick-off prompt sent to planner"
+  echo ""
+
+  _attach_or_hint
+}
+
+# Attach to the squad session if we're in a terminal; otherwise print a hint.
+# tmux refuses to attach when stdin is not a tty or when already inside tmux.
+_attach_or_hint() {
+  if [[ -n "${TMUX:-}" ]]; then
+    echo "Already inside a tmux session — run 'squad attach' from a fresh terminal,"
+    echo "or detach this tmux (Ctrl+B then d) and re-run 'squad attach'."
+    return 0
+  fi
+  if [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
+    echo "Squad is running detached. Run 'squad attach' to jump in."
+    return 0
+  fi
+  echo "Attaching… (Ctrl+B then d to detach; 'squad attach' to re-join later)"
+  exec tmux attach-session -t "$SQUAD_SESSION"
+}
+
+# Legacy fixed-roster boot. Unchanged behavior, preserved behind --static.
+_cmd_start_static() {
+  local sprint_file="$1"
+  local roles_str="$2"
+  local use_worktrees="$3"
+  local model="$4"
+
+  IFS=',' read -ra roles <<< "$roles_str"
+
+  for role in "${roles[@]}"; do
+    if ! validate_role "$role"; then
+      echo "Error: unknown role '$role'. Run 'squad roles' to see available roles." >&2
+      exit 1
+    fi
+  done
+
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║  Claude Squad v${SQUAD_VERSION}                               ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+  echo "Mode:       static (legacy fixed roster)"
+  echo "Repo:       $REPO_PATH"
+  echo "Roles:      ${roles[*]}"
+  echo "Sprint:     ${sprint_file:-none}"
+  echo "Worktrees:  $use_worktrees"
+  echo "Model:      $model"
+  echo ""
+
+  local squad_runtime="${REPO_PATH}/.squad"
+  mkdir -p "$squad_runtime"
+
+  local session_id
+  session_id=$(generate_session_id)
+
+  local roles_json="["
+  for ((i = 0; i < ${#roles[@]}; i++)); do
+    [[ $i -gt 0 ]] && roles_json+=","
+    roles_json+="\"${roles[$i]}\""
+  done
+  roles_json+="]"
+
+  cat > "${squad_runtime}/session.json" << HEREDOC
+{
+  "session_id": "${session_id}",
+  "roles": ${roles_json},
+  "repo_path": "${REPO_PATH}",
+  "sprint_file": "${sprint_file}",
+  "use_worktrees": ${use_worktrees},
+  "model": "${model}",
+  "start_time": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "agents": []
+}
+HEREDOC
+
+  squad_mailbox_init "$squad_runtime" >/dev/null
+
+  if [[ "$use_worktrees" == "true" ]]; then
+    echo "Creating git worktrees for agent isolation..."
+    local _wt_path
+    for role in "${roles[@]}"; do
+      _wt_path=$(squad_worktree_create "$REPO_PATH" "$role" "$session_id")
+      if [[ -n "$_wt_path" ]] && [[ -d "$_wt_path" ]]; then
+        echo "  $role → $_wt_path"
+      else
+        echo "  Warning: failed to create worktree for $role" >&2
+      fi
+    done
+    echo ""
+  fi
+
+  echo "Generating agent prompts..."
+  squad_prompt_generate_all "$squad_runtime" "$REPO_PATH" "$sprint_file" "$model" "${roles[@]}" >/dev/null
+  echo "  Generated prompts and launchers for: ${roles[*]}"
+  echo ""
+
+  echo "Creating tmux session..."
+  squad_tmux_create_session "${roles[@]}"
+  echo ""
+
+  echo "Launching agents..."
+  for ((i = 0; i < ${#roles[@]}; i++)); do
+    local role="${roles[$i]}"
+    local launch_file="${squad_runtime}/launch-${role}.sh"
+    if [[ -f "$launch_file" ]]; then
+      squad_tmux_launch "$i" "bash ${launch_file}"
+      echo "  Pane $i: $role launched"
+    else
+      echo "  Warning: no launcher for $role" >&2
+    fi
+  done
+
+  echo ""
+  echo "Waiting for agents to initialize..."
+  sleep 8
+
+  for ((i = 0; i < ${#roles[@]}; i++)); do
+    local role="${roles[$i]}"
+    local kickoff=""
+    case "$role" in
+      coder)    kickoff="Read the sprint file and begin your workflow. Implement the sprint marked [CURRENT]." ;;
+      tester)   kickoff="Read the sprint file and begin your workflow. Check for [TESTING] sprints. If none, poll the mailbox every 30 seconds." ;;
+      planner)  kickoff="Read the sprint file and begin your workflow. Expand the spec and define sprint contracts." ;;
+      reviewer) kickoff="Read the sprint file and begin your workflow. Review any code changes and provide feedback." ;;
+      *)        kickoff="Read the sprint file and mailbox, then begin your workflow." ;;
+    esac
+    squad_tmux_send "$i" "$kickoff"
+    echo "  Pane $i: $role — kick-off prompt sent"
+  done
+
+  echo ""
+  _attach_or_hint
+}
+
+cmd_stop() {
+  local squad_runtime="${REPO_PATH}/.squad"
+
+  # Clean up worktrees if they exist
+  if [[ -f "${squad_runtime}/session.json" ]]; then
+    local session_id use_worktrees
+    session_id=$(jq -r '.session_id' "${squad_runtime}/session.json" 2>/dev/null)
+    use_worktrees=$(jq -r '.use_worktrees' "${squad_runtime}/session.json" 2>/dev/null)
+
+    if [[ "$use_worktrees" == "true" ]] && [[ -n "$session_id" ]]; then
+      echo "Cleaning up worktrees..."
+      squad_worktree_cleanup "$REPO_PATH" "$session_id"
+    fi
+  fi
+
+  # Kill tmux session
+  squad_tmux_kill_session
+
+  echo "Squad stopped."
+}
+
+cmd_status() {
+  local squad_runtime="${REPO_PATH}/.squad"
+  squad_monitor_status "$squad_runtime" "$REPO_PATH"
+}
+
+cmd_watch() {
+  local squad_runtime="${REPO_PATH}/.squad"
+  local interval="${1:-5}"
+  squad_monitor_watch "$squad_runtime" "$REPO_PATH" "$interval"
+}
+
+cmd_attach() {
+  squad_tmux_attach
+}
+
+cmd_roles() {
+  echo "Available roles:"
+  echo ""
+  local _r_name _r_desc
+  for role_file in "${SQUAD_DIR}/roles/"*.md; do
+    if [[ -f "$role_file" ]]; then
+      _r_name=$(basename "$role_file" .md)
+      _r_desc=$(sed -n '3p' "$role_file" | sed 's/^[[:space:]]*//' | cut -c1-70)
+      printf "  %-12s %s\n" "$_r_name" "${_r_desc:-$(head -1 "$role_file")}"
+    fi
+  done
+  echo ""
+  echo "Use: squad start --roles role1,role2,..."
+}
+
+cmd_init() {
+  mkdir -p "${REPO_PATH}/sprints"
+  cp "${SQUAD_DIR}/templates/sprint.md" "${REPO_PATH}/sprints/sprint-template.md"
+  echo "Created sprints/sprint-template.md"
+  echo "Edit the file and run: squad start sprints/sprint-template.md"
+}
+
+cmd_roster() {
+  local squad_runtime="${REPO_PATH}/.squad"
+  if [[ ! -f "${squad_runtime}/session.json" ]]; then
+    echo "No active squad session in ${REPO_PATH}" >&2
+    exit 1
+  fi
+  squad_registry_roster_markdown "$squad_runtime"
+}
+
+cmd_harness() {
+  local prompt="${1:-}"
+  local model="${2:-claude-opus-4-6}"
+
+  if [[ -z "$prompt" ]]; then
+    echo "Usage: squad harness \"Build a ...\" [model]" >&2
+    exit 1
+  fi
+
+  squad_harness_run "$prompt" "$REPO_PATH" "$model"
+}
+
+cmd_merge() {
+  local role="${1:-}"
+  local squad_runtime="${REPO_PATH}/.squad"
+
+  if [[ -z "$role" ]]; then
+    echo "Usage: squad merge <role>" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "${squad_runtime}/session.json" ]]; then
+    echo "Error: no active session found" >&2
+    exit 1
+  fi
+
+  local session_id target_branch
+  session_id=$(jq -r '.session_id' "${squad_runtime}/session.json")
+  target_branch=$(git -C "$REPO_PATH" branch --show-current)
+
+  echo "Merging $role's worktree branch into $target_branch..."
+  squad_worktree_merge "$REPO_PATH" "$role" "$session_id" "$target_branch"
+  echo "Done."
+}
+
+# ─── Main ────────────────────────────────────────────────────────
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    start)    cmd_start "$@" ;;
+    stop)     cmd_stop ;;
+    status)   cmd_status ;;
+    watch)    cmd_watch "$@" ;;
+    attach)   cmd_attach ;;
+    roles)    cmd_roles ;;
+    roster)   cmd_roster ;;
+    init)     cmd_init ;;
+    harness)  cmd_harness "$@" ;;
+    merge)    cmd_merge "$@" ;;
+    help|-h|--help)
+      usage
+      ;;
+    version|--version|-v)
+      echo "Claude Squad v${SQUAD_VERSION}"
+      ;;
+    *)
+      echo "Unknown command: $command" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

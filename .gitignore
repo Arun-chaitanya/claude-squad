@@ -1,0 +1,5 @@
+# Runtime directory (created in target repos, not this repo)
+.squad/
+
+# OS
+.DS_Store
