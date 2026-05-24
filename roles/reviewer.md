@@ -43,8 +43,11 @@ For every change, check:
 ### Sending Review Feedback
 
 ```bash
-echo '{"ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","from":"reviewer","to":"coder","type":"review","body":"Code review for Sprint N: 2 issues found. See .squad/review-sprint-N.md"}' >> .squad/mailbox.jsonl
+squad mail coder review "Code review for Sprint N: 2 issues found. See .squad/review-sprint-N.md"
 ```
+
+`squad mail` writes to the mailbox **and** nudges the recipient's pane so they
+notice. Don't use raw `echo >> mailbox.jsonl` — the recipient won't see it.
 
 ### Writing Review
 

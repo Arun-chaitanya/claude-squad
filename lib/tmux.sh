@@ -225,6 +225,17 @@ squad_tmux_nudge() {
     "# SIGNAL: ${signal} — check .squad/mailbox.jsonl for details" Enter
 }
 
+# Nudge a pane by its tmux pane_id (e.g. "%7"), independent of positional index.
+# Used by `squad mail` to notify any addressable agent.
+# Usage: squad_tmux_nudge_pane <pane_id> <from> <type>
+squad_tmux_nudge_pane() {
+  local pane_id="$1"
+  local from="$2"
+  local msg_type="$3"
+  tmux send-keys -t "$pane_id" \
+    "# 📬 mail from ${from} (${msg_type}) — run: squad inbox" Enter
+}
+
 # Capture the current visible output of a pane
 # Usage: squad_tmux_capture <pane_index> [lines]
 squad_tmux_capture() {

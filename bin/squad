@@ -1072,6 +1072,106 @@ cmd_usage() {
 # squad recycle <name> [--reason "..."] [--grace-seconds N] [--fresh]
 # Convenience: kill <name> then spawn the same role + instance again. The
 # default behavior preserves the Claude session (--resume) and worktree, so
+# Send a message to another agent and nudge their pane.
+# Sender is taken from $SQUAD_AGENT_NAME (exported into each pane by the launcher).
+# Recipient is resolved against the live registry; `all` broadcasts to every
+# alive agent except the sender. Falls back to mailbox-only write if the
+# recipient has no pane (e.g., killed or not yet spawned).
+#
+# Usage: squad mail <to_name> <type> <body...>
+cmd_mail() {
+  _resolve_squad_name "$@"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
+
+  local from="${SQUAD_AGENT_NAME:-}"
+  if [[ -z "$from" ]]; then
+    echo "Error: \$SQUAD_AGENT_NAME is not set. Run this from inside a squad agent pane, or export SQUAD_AGENT_NAME first." >&2
+    return 1
+  fi
+
+  local to="${1:-}"
+  local msg_type="${2:-}"
+  shift 2 2>/dev/null || true
+  local body="$*"
+
+  if [[ -z "$to" || -z "$msg_type" || -z "$body" ]]; then
+    echo "Usage: squad mail <to_name> <type> <body...>" >&2
+    return 1
+  fi
+
+  squad_mailbox_send "$squad_runtime" "$from" "$to" "$msg_type" "$body"
+
+  local session_file="${squad_runtime}/session.json"
+  if [[ ! -f "$session_file" ]]; then
+    return 0
+  fi
+
+  if [[ "$to" == "all" ]]; then
+    # Nudge every alive agent except the sender.
+    local pid
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      squad_tmux_nudge_pane "$pid" "$from" "$msg_type"
+    done < <(jq -r --arg me "$from" '
+      .agents[]
+      | select(.status == "alive" and .name != $me)
+      | .pane_id
+    ' "$session_file")
+  else
+    local pane_id
+    pane_id=$(jq -r --arg name "$to" '
+      .agents[] | select(.name == $name and .status == "alive") | .pane_id
+    ' "$session_file")
+    if [[ -n "$pane_id" && "$pane_id" != "null" ]]; then
+      squad_tmux_nudge_pane "$pane_id" "$from" "$msg_type"
+    else
+      echo "Note: recipient '${to}' has no live pane — message queued in mailbox only." >&2
+    fi
+  fi
+}
+
+# Show mail addressed to the caller (or to `all`).
+# Usage: squad inbox [--since <iso-timestamp>] [--all] [--name <override>]
+cmd_inbox() {
+  _resolve_squad_name "$@"
+  local squad_runtime
+  squad_runtime=$(_squad_runtime)
+
+  local who="${SQUAD_AGENT_NAME:-}"
+  local since=""
+  local show_all=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since) since="$2"; shift 2 ;;
+      --all)   show_all=1; shift ;;
+      --name)  who="$2"; shift 2 ;;
+      --name=*) who="${1#--name=}"; shift ;;
+      *)       shift ;;
+    esac
+  done
+
+  if [[ -z "$who" ]]; then
+    echo "Error: cannot determine inbox owner. Pass --name <agent> or run from inside a squad pane." >&2
+    return 1
+  fi
+
+  local mailbox="${squad_runtime}/mailbox.jsonl"
+  if [[ ! -f "$mailbox" ]]; then
+    return 0
+  fi
+
+  local filter='select(.to == $me or .to == "all")'
+  if [[ "$show_all" == "1" ]]; then
+    filter='.'
+  fi
+  if [[ -n "$since" ]]; then
+    filter="${filter} | select(.ts > \$since)"
+  fi
+
+  jq -c --arg me "$who" --arg since "$since" "$filter" "$mailbox"
+}
+
 # this is a "context refresh after fatigue" verb. Pass --fresh to start with
 # a brand-new Claude session.
 cmd_recycle() {
@@ -1198,6 +1298,8 @@ main() {
     doctor)   cmd_doctor "$@" ;;
     usage)    cmd_usage "$@" ;;
     recycle)  cmd_recycle "$@" ;;
+    mail)     cmd_mail "$@" ;;
+    inbox)    cmd_inbox "$@" ;;
     init)     cmd_init ;;
     harness)  cmd_harness "$@" ;;
     merge)    cmd_merge "$@" ;;

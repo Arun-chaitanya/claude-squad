@@ -69,15 +69,25 @@ $(cat "$role_file")
 
 ## Mailbox Quick-Reference
 
+The mailbox is a shared JSONL file. The \`squad\` CLI provides verbs that handle
+the file I/O *and* wake up the recipient's pane — prefer them over raw \`echo\`,
+otherwise the recipient won't know a message arrived.
+
 ### Read messages addressed to you
 \`\`\`bash
-jq -c 'select(.to == "${name}" or .to == "all")' ${squad_dir}/mailbox.jsonl
+squad inbox                        # mail addressed to you (or to "all")
+squad inbox --since 2026-05-24T00:00:00Z   # mail since a given timestamp
 \`\`\`
 
 ### Send a message
 \`\`\`bash
-echo '{"ts":"'\$(date -u +%Y-%m-%dT%H:%M:%SZ)'","from":"${name}","to":"TARGET_NAME","type":"MESSAGE_TYPE","body":"Your message"}' >> ${squad_dir}/mailbox.jsonl
+squad mail <to_name> <type> <body...>      # writes mailbox + nudges recipient
+squad mail tester request "story 3 ready for verification"
+squad mail all notification "switching to feature branch foo"
 \`\`\`
+
+\`<to_name>\` is the recipient's name from \`squad roster\` (e.g. \`coder\`, \`tester-2\`).
+\`<type>\` is a free-form label (see \`lib/mailbox.sh\` for the catalog).
 
 ## Begin
 Start by reading the mailbox and any handoff file, then begin your workflow.
@@ -112,6 +122,8 @@ squad_prompt_launcher_dynamic() {
   cat > "$launch_file" << HEREDOC
 #!/usr/bin/env bash
 # Auto-generated launcher for ${name} agent
+export SQUAD_AGENT_NAME="${name}"
+export SQUAD_RUNTIME="${squad_dir}"
 cd "${work_dir}"
 exec claude --dangerously-skip-permissions --append-system-prompt-file "${prompt_file}" --model "${model}" ${session_flag}
 HEREDOC
@@ -183,15 +195,20 @@ $(cat "$role_file")
 
 ## Harness Communication Protocol
 
+The \`squad\` CLI handles mailbox I/O *and* wakes up the recipient's pane.
+Always prefer it over raw \`echo\` — otherwise the recipient won't know mail
+arrived.
+
 ### Reading the Mailbox
-To check for new messages addressed to you:
 \`\`\`bash
-cat ${squad_dir}/mailbox.jsonl | grep '"to":"${role_name}"'
+squad inbox                        # mail addressed to you (or to "all")
 \`\`\`
 
 ### Sending a Message
 \`\`\`bash
-echo '{"ts":"'\$(date -u +%Y-%m-%dT%H:%M:%SZ)'","from":"${role_name}","to":"TARGET_ROLE","type":"MESSAGE_TYPE","body":"Your message"}' >> ${squad_dir}/mailbox.jsonl
+squad mail <to_name> <type> <body...>
+squad mail tester request "story 3 ready for verification"
+squad mail all notification "switching to feature branch foo"
 \`\`\`
 
 ### Context Reset Protocol
@@ -226,6 +243,8 @@ squad_prompt_launcher() {
   cat > "$launch_file" << HEREDOC
 #!/usr/bin/env bash
 # Auto-generated launcher for ${role_name} agent
+export SQUAD_AGENT_NAME="${role_name}"
+export SQUAD_RUNTIME="${squad_dir}"
 cd "${work_dir}"
 exec claude --dangerously-skip-permissions --append-system-prompt-file "${prompt_file}" --model "${model}"
 HEREDOC
