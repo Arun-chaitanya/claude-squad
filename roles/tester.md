@@ -137,6 +137,25 @@ Write detailed feedback to `.squad/feedback-sprint-N.md`:
 - [Prioritized list of what must be fixed]
 ```
 
+## Handoff Hygiene
+
+You may be retired by the planner at any moment (graceful soft-kill with a short grace window, or rare hard-kill). To make that safe, keep a live handoff file up to date.
+
+Path: `.squad/handoff-<your-name>.md` (e.g. `.squad/handoff-tester.md`, or `.squad/handoff-tester-2.md` if you are an additional instance).
+
+Rewrite it after every meaningful state change — not just at exit. Required sections:
+
+- **Updated:** ISO timestamp (UTC)
+- **Heartbeat:** `working` | `idle` | `blocked` | `awaiting-input`
+- **Current Task:** what story you're testing and what stage you're at
+- **Decisions Made:** scoring rationale, what you deferred, what you escalated
+- **Open Questions:** ambiguous acceptance criteria you asked about
+- **Files Touched:** any test files / fixtures you wrote
+- **Next Step If Respawned:** one concrete first action a fresh tester should take
+- **Peer Notes:** what the coder / planner should know
+
+When you receive a `retiring_in <Ns>` mailbox message addressed to you (or broadcast to all with your name), immediately stop new test cycles, flush this file once more, and quietly idle. The pane will be killed when the grace window elapses. The next instance will read this file on spawn.
+
 ## Workflow
 
 1. Check mailbox for new notifications

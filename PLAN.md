@@ -119,20 +119,34 @@ Rule: **after every story the squad is fully usable end-to-end up to the capabil
 
 ---
 
-### Story 6 — Peer-to-peer mailbox protocol: any agent can `request_spawn`, `request_close`, `request_keep_alive`
+### Story 6 — Free-flowing peer collaboration with planner-driven recycling
 
-**What ships:** Mailbox type catalog extended (`request_spawn`, `request_close`, `request_keep_alive`, `handoff_ready`, `arbitrate`, `clarify`, `block`, `status_update`, plus the existing types). Envelope gains `id` / `in_reply_to` / `priority`. Planner role gains arbiter behavior: drains mailbox each cycle, debounces conflicting requests for 10s, emits a single binding `arbitrate` message. Coder role gains roster-check + "if tester isn't alive when story moves to TESTING, send `request_spawn` to planner." Coder's obsolete "do NOT send tmux notifications to tester while mid-testing" rule is deleted — async mailbox replaces it.
+**What ships:** Two things working together.
+
+**(A) Peer-to-peer mailbox.** Mailbox type catalog extended (`notification`, `request`, `ack`, `decline`, `result`, `clarify`, `block`, `status_update`, `redirect`, `agent_spawned`, `agent_closing`, `agent_closed`, `agent_vanished`, plus a new `retiring_in <Ns>` event for the recycle flow below). Envelope gains `id` / `in_reply_to` / `priority`. Coder and tester talk to each other directly via mailbox — no planner gatekeeping. Coder's obsolete "do NOT send tmux notifications to tester while mid-testing" rule is deleted; async mailbox replaces it.
+
+**(B) Planner as fatigue watcher.** Agents do NOT decide their own lifecycle. They just work. The planner is the only watcher and makes recycle decisions based on a combination of signals:
+
+| Signal | Source | Trigger |
+|---|---|---|
+| Tokens consumed by this instance | `~/.claude/projects/.../*.jsonl` session log (find by spawned_at) | ≥ ~150k = danger zone; planner should retire before next task |
+| Wall time alive | registry `spawned_at` | very long-running instances get a periodic "still healthy?" check |
+| Semantic boundary | sprint file status changes + planner judgment | story `[DONE]` + next story is meaningfully different → fresh instance even if well under budget; same applies when an unrelated bug arrives |
+| Mailbox volume from/to agent | `mailbox.jsonl` count | proxy for "how much has this agent been juggling" |
+
+Planner reads these on each cycle and decides whether to recycle. Recycle = `squad kill <name>` (graceful — agent gets `retiring_in 30s`, writes handoff) then `squad spawn <role>` (new instance reads handoff and picks up the next task). Story 4's resume preamble already covers the pickup side.
+
+**Critical rule (encoded in planner.md):** Even with a half-empty token budget, when the *next* task is meaningfully unrelated to what the current agent has been doing (new bug type, new story building on different surfaces, new testing dimension), the planner spawns a fresh instance. Context boundaries are semantic, not just numeric.
 
 **Demo after this story:**
-- `squad start`, chat with planner to write a one-story sprint, say "go."
-- Planner sends `request_spawn coder` to itself-as-arbiter, then spawns coder.
-- Coder reads the sprint, implements story 1, sends `request_spawn tester` to planner; planner spawns tester.
-- Coder marks story `[TESTING]`, tester picks it up, files a bug via `result` message, sends `request_keep_alive coder` (because fix is expected).
-- Coder fixes, sends `request_close tester` saying "story passed, close tester."
-- Tester sends `request_keep_alive tester` arguing for regression. Planner emits an `arbitrate` decision within 30s.
-- You can see all of this via `cat .squad/mailbox.jsonl | jq`.
+- `squad start`, plan a 2-story sprint, say "go."
+- Planner spawns coder. Coder implements Story 1.1, talks directly to tester via mailbox. Tester verifies, posts `result`. Story 1.1 marked `[DONE]`.
+- Planner sees Story 1.1 done + Story 1.2 is queued. Decides 1.2 deserves a fresh coder (semantic boundary). Sends `retiring_in 30s` to coder, runs `squad kill coder`, then `squad spawn coder` for 1.2.
+- New coder picks up from handoff, implements 1.2, also talks to the same tester directly.
+- During 1.2, push the coder hard (force it to use ~140k tokens). On next cycle, planner sees the budget signal and proactively recycles it after current work flushes.
+- Inspect: `cat .squad/mailbox.jsonl | jq` shows the free-flowing peer messages + the planner's retiring/spawn events with rationale in the body.
 
-**Out of scope this story:** hybrid Playwright testing changes, vertical-slice sprint template rewrite, reviewer role.
+**Out of scope this story:** vertical-slice sprint template (Story 7), MCP Playwright (Story 8), reviewer (Story 9).
 
 ---
 

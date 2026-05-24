@@ -4,6 +4,90 @@
 
 SQUAD_SESSION="claude-squad"
 
+# ─── Dynamic pane helpers (Stories 2+3) ────────────────────────────────────
+# These primitives work with stable tmux pane ids (%N), set on each pane via
+# user options @agent_role / @agent_instance / @agent_spawned_at.
+# Pane ids survive layout changes, manual swaps, and other panes being killed.
+
+# Look up the pane id (%N) for a role-instance name (e.g. "coder", "coder-2").
+# Convention: "coder" matches instance 1 of role "coder" when it's the only
+# alive instance; otherwise the caller must pass the suffixed name.
+# Usage: squad_tmux_pane_for_name <name>
+squad_tmux_pane_for_name() {
+  local name="$1"
+  local role instance
+  if [[ "$name" =~ ^(.+)-([0-9]+)$ ]]; then
+    role="${BASH_REMATCH[1]}"
+    instance="${BASH_REMATCH[2]}"
+  else
+    role="$name"
+    instance="1"
+  fi
+  tmux list-panes -t "$SQUAD_SESSION" \
+    -F '#{pane_id} #{@agent_role} #{@agent_instance}' 2>/dev/null \
+    | awk -v r="$role" -v n="$instance" '$2==r && $3==n {print $1; exit}'
+}
+
+# List one TSV line per alive pane: pane_id<TAB>role<TAB>instance.
+# Usage: squad_tmux_list_agents
+squad_tmux_list_agents() {
+  tmux list-panes -t "$SQUAD_SESSION" \
+    -F '#{pane_id}	#{@agent_role}	#{@agent_instance}' 2>/dev/null \
+    | awk -F'\t' '$2 != "" {print}'
+}
+
+# Spawn a new pane for a role, label it, and launch a command.
+# Returns the new pane id on stdout.
+# Usage: squad_tmux_spawn <role> <instance> <command>
+squad_tmux_spawn() {
+  local role="$1"
+  local instance="$2"
+  local command="$3"
+
+  if ! tmux has-session -t "$SQUAD_SESSION" 2>/dev/null; then
+    echo "Error: no active session '$SQUAD_SESSION'" >&2
+    return 1
+  fi
+
+  # Split from the planner's pane when available, otherwise from the first pane.
+  local target
+  target=$(squad_tmux_pane_for_name "planner")
+  if [[ -z "$target" ]]; then
+    target=$(tmux list-panes -t "$SQUAD_SESSION" -F '#{pane_id}' | head -1)
+  fi
+
+  # -P prints the new pane id; -F controls its format.
+  local new_id
+  new_id=$(tmux split-window -t "$target" -P -F '#{pane_id}')
+  tmux select-layout -t "$SQUAD_SESSION" tiled >/dev/null
+
+  tmux set-option -t "$new_id" -p @agent_role "$role"
+  tmux set-option -t "$new_id" -p @agent_instance "$instance"
+  tmux set-option -t "$new_id" -p @agent_spawned_at "$(date -u +%s)"
+
+  tmux send-keys -t "$new_id" "$command" Enter
+  echo "$new_id"
+}
+
+# Kill a pane by id and re-tile.
+# Usage: squad_tmux_kill_pane <pane_id>
+squad_tmux_kill_pane() {
+  local pane_id="$1"
+  tmux kill-pane -t "$pane_id" 2>/dev/null || true
+  # Re-tile if the session still exists
+  if tmux has-session -t "$SQUAD_SESSION" 2>/dev/null; then
+    tmux select-layout -t "$SQUAD_SESSION" tiled >/dev/null 2>&1 || true
+  fi
+}
+
+# How many panes are alive in the session.
+# Usage: squad_tmux_pane_count_live
+squad_tmux_pane_count_live() {
+  tmux list-panes -t "$SQUAD_SESSION" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+
 # Create the tmux session with a single pane for one role.
 # Used by the default dynamic boot path — additional panes are spawned later.
 # Usage: squad_tmux_create_single_pane <role> [instance]

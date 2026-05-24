@@ -41,6 +41,13 @@ COMMANDS:
   watch                Live-updating status dashboard
   attach               Attach to the tmux session
   roles                List available roles
+  roster               Show the live agent registry as a markdown table
+  spawn <role>         Spawn a new agent pane at runtime (e.g. coder, tester)
+                       Flags: [--instance N] [--worktree|--no-worktree]
+                              [--model M] [--fresh]
+  kill <name>          Gracefully retire an agent (soft kill + grace window)
+                       Flags: [--hard] [--grace-seconds N]
+  doctor               Reconcile registry vs tmux; flip orphans to vanished
   init                 Copy sprint template to ./sprints/
   harness <prompt>     Run headless GAN-style harness (no tmux)
   merge <role>         Merge a role's worktree branch back to main
@@ -410,6 +417,280 @@ cmd_roster() {
   squad_registry_roster_markdown "$squad_runtime"
 }
 
+# Acquire the spawn lock so two concurrent spawns can't pick the same instance.
+# Returns 0 on success.
+_spawn_lock_acquire() {
+  local squad_dir="$1"
+  local lockfile="${squad_dir}/spawn.lock"
+  local max_wait=100  # 10s total
+  local waited=0
+  while ! mkdir "$lockfile" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [[ $waited -ge $max_wait ]]; then
+      rm -rf "$lockfile"
+      mkdir "$lockfile" 2>/dev/null || return 1
+      break
+    fi
+    sleep 0.1
+  done
+  return 0
+}
+
+_spawn_lock_release() {
+  rm -rf "${1}/spawn.lock"
+}
+
+# squad spawn <role> [--instance N] [--worktree] [--no-worktree] [--model M] [--fresh]
+cmd_spawn() {
+  local role=""
+  local force_instance=""
+  local worktree_flag=""     # "" = inherit session default; "1" = force on; "0" = force off
+  local model_override=""
+  local fresh=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --instance)    force_instance="$2"; shift 2 ;;
+      --worktree)    worktree_flag="1"; shift ;;
+      --no-worktree) worktree_flag="0"; shift ;;
+      --model)       model_override="$2"; shift 2 ;;
+      --fresh)       fresh=true; shift ;;
+      -*)            echo "Unknown option: $1" >&2; exit 1 ;;
+      *)             role="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$role" ]]; then
+    echo "Usage: squad spawn <role> [--instance N] [--worktree|--no-worktree] [--model M] [--fresh]" >&2
+    exit 1
+  fi
+
+  # Planner is a singleton — never spawn a second one.
+  if [[ "$role" == "planner" ]]; then
+    echo "Error: planner is a singleton — cannot be spawned again." >&2
+    echo "       To restart the planner, run 'squad stop' and 'squad start'." >&2
+    exit 1
+  fi
+
+  if ! validate_role "$role"; then
+    echo "Error: unknown role '$role'. Run 'squad roles' to see available." >&2
+    exit 1
+  fi
+
+  local squad_runtime="${REPO_PATH}/.squad"
+  if [[ ! -f "${squad_runtime}/session.json" ]]; then
+    echo "Error: no active session. Run 'squad start' first." >&2
+    exit 1
+  fi
+  if ! tmux has-session -t "$SQUAD_SESSION" 2>/dev/null; then
+    echo "Error: tmux session '$SQUAD_SESSION' is not running." >&2
+    exit 1
+  fi
+
+  local session_id session_model session_use_wt session_sprint
+  session_id=$(jq -r '.session_id' "${squad_runtime}/session.json")
+  session_model=$(jq -r '.model' "${squad_runtime}/session.json")
+  session_use_wt=$(jq -r '.use_worktrees' "${squad_runtime}/session.json")
+  session_sprint=$(jq -r '.sprint_file // ""' "${squad_runtime}/session.json")
+
+  local model="${model_override:-$session_model}"
+  local use_wt="$session_use_wt"
+  [[ "$worktree_flag" == "1" ]] && use_wt="true"
+  [[ "$worktree_flag" == "0" ]] && use_wt="false"
+
+  _spawn_lock_acquire "$squad_runtime" || { echo "Error: spawn lock timeout" >&2; exit 1; }
+
+  # Decide instance number. By default reuse the lowest free slot ≥1 so a
+  # killed coder-2 resumes as coder-2 (handoff filenames line up).
+  local instance="$force_instance"
+  if [[ -z "$instance" ]]; then
+    instance=$(_next_free_instance "$squad_runtime" "$role")
+  fi
+  local name="$role"
+  [[ "$instance" -gt 1 ]] && name="${role}-${instance}"
+
+  # Refuse to spawn a duplicate alive instance.
+  local existing_pane
+  existing_pane=$(squad_tmux_pane_for_name "$name")
+  if [[ -n "$existing_pane" ]]; then
+    _spawn_lock_release "$squad_runtime"
+    echo "Error: ${name} is already alive in pane ${existing_pane}." >&2
+    exit 1
+  fi
+
+  # Archive the handoff if --fresh was requested.
+  if $fresh && [[ -f "${squad_runtime}/handoff-${name}.md" ]]; then
+    local ts
+    ts=$(date -u +%s)
+    mv "${squad_runtime}/handoff-${name}.md" "${squad_runtime}/handoff-${name}.archived-${ts}.md"
+    echo "  Archived prior handoff to handoff-${name}.archived-${ts}.md"
+  fi
+
+  # Worktree (reuse if already present from a prior life).
+  local work_dir="$REPO_PATH"
+  local wt_path=""
+  if [[ "$use_wt" == "true" ]]; then
+    wt_path=$(squad_worktree_path "$name" "$session_id")
+    if [[ -d "$wt_path" ]]; then
+      echo "  Reusing existing worktree at $wt_path"
+    else
+      wt_path=$(squad_worktree_create "$REPO_PATH" "$name" "$session_id")
+    fi
+    if [[ -n "$wt_path" ]] && [[ -d "$wt_path" ]]; then
+      work_dir="$wt_path"
+    else
+      echo "  Warning: failed to create worktree; falling back to repo root" >&2
+      wt_path=""
+    fi
+  fi
+
+  squad_prompt_generate_dynamic "$squad_runtime" "$name" "$role" "$work_dir" "$session_sprint" >/dev/null
+  squad_prompt_launcher_dynamic "$squad_runtime" "$name" "$work_dir" "$model" >/dev/null
+
+  local pane_id
+  pane_id=$(squad_tmux_spawn "$role" "$instance" "bash ${squad_runtime}/launch-${name}.sh")
+
+  local agent_json
+  agent_json=$(jq -n \
+    --arg role "$role" --argjson instance "$instance" --arg name "$name" \
+    --arg pane_id "$pane_id" --arg wt "$wt_path" --arg model "$model" \
+    --arg spawned_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    '{role:$role, instance:$instance, name:$name, pane_id:$pane_id,
+      worktree_path:$wt, model:$model, spawned_at:$spawned_at, status:"alive"}')
+  squad_registry_add "$squad_runtime" "$agent_json"
+
+  squad_mailbox_send "$squad_runtime" "system" "all" "agent_spawned" \
+    "{\"name\":\"${name}\",\"role\":\"${role}\",\"pane_id\":\"${pane_id}\"}"
+
+  _spawn_lock_release "$squad_runtime"
+
+  echo "Spawned ${name} (${pane_id}) in ${work_dir}"
+}
+
+# Lowest free instance ≥1 for a role: walks alive panes + the registry's
+# killed/vanished records and returns the first integer that isn't taken.
+_next_free_instance() {
+  local squad_dir="$1"
+  local role="$2"
+  local taken
+  taken=$(
+    {
+      tmux list-panes -t "$SQUAD_SESSION" \
+        -F '#{@agent_role} #{@agent_instance}' 2>/dev/null \
+        | awk -v r="$role" '$1==r {print $2}'
+      jq -r --arg role "$role" '
+        .agents[] | select(.role == $role) | .instance
+      ' "${squad_dir}/session.json" 2>/dev/null
+    } | sort -un
+  )
+  local i=1
+  while echo "$taken" | grep -qx "$i"; do
+    i=$((i + 1))
+  done
+  echo "$i"
+}
+
+# squad kill <name> [--hard] [--grace-seconds N]
+cmd_kill() {
+  local name=""
+  local hard=false
+  local grace=10
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --hard)           hard=true; shift ;;
+      --grace-seconds)  grace="$2"; shift 2 ;;
+      -*)               echo "Unknown option: $1" >&2; exit 1 ;;
+      *)                name="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: squad kill <name> [--hard] [--grace-seconds N]" >&2
+    exit 1
+  fi
+
+  local squad_runtime="${REPO_PATH}/.squad"
+  if [[ ! -f "${squad_runtime}/session.json" ]]; then
+    echo "Error: no active session." >&2
+    exit 1
+  fi
+  if ! tmux has-session -t "$SQUAD_SESSION" 2>/dev/null; then
+    echo "Error: tmux session is not running." >&2
+    exit 1
+  fi
+
+  local pane_id
+  pane_id=$(squad_tmux_pane_for_name "$name")
+  if [[ -z "$pane_id" ]]; then
+    echo "No alive agent named '${name}'."
+    exit 0
+  fi
+
+  # Last-pane guard: killing the only pane ends the tmux session entirely.
+  local live
+  live=$(squad_tmux_pane_count_live)
+  if [[ "$live" -le 1 ]]; then
+    echo "Error: '${name}' is the only pane left. Use 'squad stop' to end the session." >&2
+    exit 1
+  fi
+
+  local handoff="${squad_runtime}/handoff-${name}.md"
+
+  if ! $hard; then
+    # Soft path: announce, give the agent a grace window to flush handoff.
+    squad_mailbox_send "$squad_runtime" "system" "all" "agent_closing" \
+      "{\"name\":\"${name}\",\"pane_id\":\"${pane_id}\",\"grace_seconds\":${grace},\"handoff\":\"${handoff}\"}"
+
+    # Also poke the agent's own pane with a soft notice so it can flush even
+    # if it's mid-task and hasn't checked the mailbox yet.
+    tmux send-keys -t "$pane_id" "# RETIRING in ${grace}s — please finalize ${handoff} now" Enter 2>/dev/null || true
+
+    echo "Sent agent_closing for ${name}; waiting ${grace}s grace..."
+    sleep "$grace"
+  fi
+
+  squad_tmux_kill_pane "$pane_id"
+  squad_registry_mark_killed "$squad_runtime" "$name" "$handoff"
+
+  squad_mailbox_send "$squad_runtime" "system" "all" "agent_closed" \
+    "{\"name\":\"${name}\",\"handoff\":\"${handoff}\"}"
+
+  echo "Killed ${name} (${pane_id})."
+}
+
+# squad doctor — reconcile registry vs tmux. Flips orphans to vanished.
+cmd_doctor() {
+  local squad_runtime="${REPO_PATH}/.squad"
+  if [[ ! -f "${squad_runtime}/session.json" ]]; then
+    echo "No active squad session in ${REPO_PATH}" >&2
+    exit 1
+  fi
+
+  local alive_in_tmux alive_in_registry vanished_count=0
+  alive_in_tmux=$(squad_tmux_list_agents | awk -F'\t' '{print $1}' | sort -u)
+  alive_in_registry=$(jq -r '.agents[] | select(.status == "alive") | .name + "|" + .pane_id' \
+    "${squad_runtime}/session.json" 2>/dev/null)
+
+  local name pane_id
+  while IFS='|' read -r name pane_id; do
+    [[ -z "$name" ]] && continue
+    if ! echo "$alive_in_tmux" | grep -qx "$pane_id"; then
+      squad_registry_mark_vanished "$squad_runtime" "$name"
+      squad_mailbox_send "$squad_runtime" "system" "all" "agent_vanished" \
+        "{\"name\":\"${name}\",\"pane_id\":\"${pane_id}\"}"
+      echo "  ${name} (${pane_id}) → vanished"
+      vanished_count=$((vanished_count + 1))
+    fi
+  done <<< "$alive_in_registry"
+
+  if [[ "$vanished_count" -eq 0 ]]; then
+    echo "Registry and tmux agree. No orphans."
+  else
+    echo "Reconciled ${vanished_count} orphan(s)."
+  fi
+}
+
 cmd_harness() {
   local prompt="${1:-}"
   local model="${2:-claude-opus-4-6}"
@@ -459,6 +740,9 @@ main() {
     attach)   cmd_attach ;;
     roles)    cmd_roles ;;
     roster)   cmd_roster ;;
+    spawn)    cmd_spawn "$@" ;;
+    kill)     cmd_kill "$@" ;;
+    doctor)   cmd_doctor ;;
     init)     cmd_init ;;
     harness)  cmd_harness "$@" ;;
     merge)    cmd_merge "$@" ;;
