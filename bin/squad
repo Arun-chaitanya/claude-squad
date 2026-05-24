@@ -48,6 +48,12 @@ COMMANDS:
   kill <name>          Gracefully retire an agent (soft kill + grace window)
                        Flags: [--hard] [--grace-seconds N]
   doctor               Reconcile registry vs tmux; flip orphans to vanished
+  usage <name>         Print agent's token/time/mailbox usage as JSON
+                       (signal for the planner; does not interpret values)
+  recycle <name>       kill + spawn the same agent in one verb (preserves
+                       Claude session unless --fresh). Convenience for the
+                       planner when an agent needs a context refresh.
+                       Flags: [--reason "..."] [--grace-seconds N] [--fresh]
   init                 Copy sprint template to ./sprints/
   harness <prompt>     Run headless GAN-style harness (no tmux)
   merge <role>         Merge a role's worktree branch back to main
@@ -733,6 +739,170 @@ cmd_doctor() {
   fi
 }
 
+# squad usage <name>
+# Reads the Claude session log for an agent and prints a JSON object the
+# planner can pipe through jq:
+#   { name, status, alive_seconds, tokens_in, tokens_out, tokens_cache_read,
+#     tokens_cache_create, tokens_total, mailbox_sent, mailbox_received }
+#
+# This is a MECHANISM. It does not interpret the numbers or decide anything.
+# The planner reads it and makes its own judgment about recycling.
+cmd_usage() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: squad usage <name>" >&2
+    exit 1
+  fi
+
+  local squad_runtime="${REPO_PATH}/.squad"
+  if [[ ! -f "${squad_runtime}/session.json" ]]; then
+    echo "Error: no active session." >&2
+    exit 1
+  fi
+
+  local agent
+  agent=$(squad_registry_get "$squad_runtime" "$name")
+  if [[ -z "$agent" ]]; then
+    echo "Error: no agent named '${name}' in registry." >&2
+    exit 1
+  fi
+
+  local claude_sid status spawned_at work_dir
+  claude_sid=$(echo "$agent" | jq -r '.claude_session_id // ""')
+  status=$(echo "$agent" | jq -r '.status')
+  spawned_at=$(echo "$agent" | jq -r '.spawned_at')
+  work_dir=$(echo "$agent" | jq -r '.worktree_path // ""')
+  [[ -z "$work_dir" ]] && work_dir="$REPO_PATH"
+
+  # Claude stores logs under ~/.claude/projects/<encoded-repo-path>/<sid>.jsonl
+  # The path encoding swaps slashes for hyphens and prepends a leading hyphen.
+  local encoded
+  encoded=$(echo "$work_dir" | sed 's|/|-|g')
+  local log_file="$HOME/.claude/projects/${encoded}/${claude_sid}.jsonl"
+
+  local tokens_in=0 tokens_out=0 tokens_cache_read=0 tokens_cache_create=0
+  if [[ -n "$claude_sid" ]] && [[ -f "$log_file" ]]; then
+    # Sum every usage block in the session log.
+    local sums
+    sums=$(jq -s '
+      [.[] | select(.message.usage?) | .message.usage]
+      | {
+          in:   (map(.input_tokens // 0)               | add // 0),
+          out:  (map(.output_tokens // 0)              | add // 0),
+          cr:   (map(.cache_read_input_tokens // 0)    | add // 0),
+          cc:   (map(.cache_creation_input_tokens // 0)| add // 0)
+        }' "$log_file" 2>/dev/null)
+    if [[ -n "$sums" ]]; then
+      tokens_in=$(echo   "$sums" | jq -r '.in')
+      tokens_out=$(echo  "$sums" | jq -r '.out')
+      tokens_cache_read=$(echo "$sums" | jq -r '.cr')
+      tokens_cache_create=$(echo "$sums" | jq -r '.cc')
+    fi
+  fi
+
+  local tokens_total=$((tokens_in + tokens_out + tokens_cache_read + tokens_cache_create))
+
+  # Wall time alive (seconds since spawn).
+  local alive_seconds=0
+  if [[ -n "$spawned_at" ]]; then
+    local now spawn_epoch
+    now=$(date -u +%s)
+    # macOS BSD date: -j -f for parsing.
+    spawn_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$spawned_at" +%s 2>/dev/null \
+                  || date -u -d "$spawned_at" +%s 2>/dev/null \
+                  || echo "$now")
+    alive_seconds=$((now - spawn_epoch))
+  fi
+
+  # Mailbox activity counts.
+  local mailbox="${squad_runtime}/mailbox.jsonl"
+  local mailbox_sent=0 mailbox_received=0
+  if [[ -f "$mailbox" ]]; then
+    mailbox_sent=$(jq -c --arg name "$name" 'select(.from == $name)' "$mailbox" 2>/dev/null | wc -l | tr -d ' ')
+    mailbox_received=$(jq -c --arg name "$name" 'select(.to == $name or .to == "all")' "$mailbox" 2>/dev/null | wc -l | tr -d ' ')
+  fi
+
+  jq -n \
+    --arg name "$name" --arg status "$status" \
+    --arg sid "$claude_sid" --arg log "$log_file" \
+    --argjson alive "$alive_seconds" \
+    --argjson tin "$tokens_in" --argjson tout "$tokens_out" \
+    --argjson tcr "$tokens_cache_read" --argjson tcc "$tokens_cache_create" \
+    --argjson ttot "$tokens_total" \
+    --argjson msent "$mailbox_sent" --argjson mrecv "$mailbox_received" \
+    '{
+      name: $name,
+      status: $status,
+      claude_session_id: $sid,
+      session_log: $log,
+      alive_seconds: $alive,
+      tokens_in: $tin,
+      tokens_out: $tout,
+      tokens_cache_read: $tcr,
+      tokens_cache_create: $tcc,
+      tokens_total: $ttot,
+      mailbox_sent: $msent,
+      mailbox_received: $mrecv
+    }'
+}
+
+# squad recycle <name> [--reason "..."] [--grace-seconds N] [--fresh]
+# Convenience: kill <name> then spawn the same role + instance again. The
+# default behavior preserves the Claude session (--resume) and worktree, so
+# this is a "context refresh after fatigue" verb. Pass --fresh to start with
+# a brand-new Claude session.
+cmd_recycle() {
+  local name=""
+  local reason=""
+  local grace="10"
+  local fresh_flag=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason)         reason="$2"; shift 2 ;;
+      --grace-seconds)  grace="$2"; shift 2 ;;
+      --fresh)          fresh_flag="--fresh"; shift ;;
+      -*)               echo "Unknown option: $1" >&2; exit 1 ;;
+      *)                name="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$name" ]]; then
+    echo "Usage: squad recycle <name> [--reason \"...\"] [--grace-seconds N] [--fresh]" >&2
+    exit 1
+  fi
+
+  local squad_runtime="${REPO_PATH}/.squad"
+  if [[ ! -f "${squad_runtime}/session.json" ]]; then
+    echo "Error: no active session." >&2
+    exit 1
+  fi
+
+  local prior
+  prior=$(squad_registry_get "$squad_runtime" "$name")
+  if [[ -z "$prior" ]]; then
+    echo "Error: no agent named '${name}' in registry." >&2
+    exit 1
+  fi
+
+  local role
+  role=$(echo "$prior" | jq -r '.role')
+
+  # Broadcast the recycle intent up front so peers see WHY this is happening.
+  squad_mailbox_send "$squad_runtime" "system" "all" "recycling" \
+    "{\"name\":\"${name}\",\"reason\":\"${reason}\",\"grace_seconds\":${grace},\"fresh\":$([ -n "$fresh_flag" ] && echo true || echo false)}"
+
+  echo "Recycling ${name}${reason:+ — reason: ${reason}}"
+  cmd_kill "$name" --grace-seconds "$grace"
+  # cmd_kill exits on error; if we got here it succeeded.
+
+  if [[ -n "$fresh_flag" ]]; then
+    cmd_spawn "$role" --instance "$(echo "$prior" | jq -r '.instance')" $fresh_flag
+  else
+    cmd_spawn "$role" --instance "$(echo "$prior" | jq -r '.instance')"
+  fi
+}
+
 cmd_harness() {
   local prompt="${1:-}"
   local model="${2:-claude-opus-4-6}"
@@ -785,6 +955,8 @@ main() {
     spawn)    cmd_spawn "$@" ;;
     kill)     cmd_kill "$@" ;;
     doctor)   cmd_doctor ;;
+    usage)    cmd_usage "$@" ;;
+    recycle)  cmd_recycle "$@" ;;
     init)     cmd_init ;;
     harness)  cmd_harness "$@" ;;
     merge)    cmd_merge "$@" ;;

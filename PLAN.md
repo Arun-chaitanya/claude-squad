@@ -130,32 +130,43 @@ Rule: **after every story the squad is fully usable end-to-end up to the capabil
 
 ---
 
-### Story 5 — Free-flowing peer collaboration with planner-driven recycling
+### Story 5 — Free-flowing peer collaboration + recycling mechanism
 
-**What ships:** Two things working together.
+**What ships:** Mechanism only. No policy, no role-prompt changes (per the Design intent at the top of this doc).
 
-**(A) Peer-to-peer mailbox.** Mailbox type catalog extended (`notification`, `request`, `ack`, `decline`, `result`, `clarify`, `block`, `status_update`, `redirect`, `agent_spawned`, `agent_closing`, `agent_closed`, `agent_vanished`, plus a new `retiring_in <Ns>` event for the recycle flow below). Envelope gains `id` / `in_reply_to` / `priority`. Coder and tester talk to each other directly via mailbox — no planner gatekeeping. Coder's obsolete "do NOT send tmux notifications to tester while mid-testing" rule is deleted; async mailbox replaces it.
+**(A) Peer-to-peer mailbox.** The mailbox already routes any `from → to`. This story just adds a type-catalog comment in `lib/mailbox.sh` documenting the conventions agents can use: `notification`, `request`, `ack`/`decline`, `result`, `clarify`, `block`, `status_update`, `redirect`, plus system lifecycle events (`agent_spawned`, `agent_closing`, `agent_closed`, `agent_vanished`, `recycling`). Nothing is enforced — agents choose what fits the moment.
 
-**(B) Planner as fatigue watcher.** Agents do NOT decide their own lifecycle. They just work. The planner is the only watcher and makes recycle decisions based on a combination of signals:
+**(B) Signal source for the planner.** `squad usage <name>` reads the agent's Claude session log (`~/.claude/projects/<encoded-repo-path>/<session_id>.jsonl`) and prints a JSON object:
 
-| Signal | Source | Trigger |
-|---|---|---|
-| Tokens consumed by this instance | `~/.claude/projects/.../*.jsonl` session log (find by spawned_at) | ≥ ~150k = danger zone; planner should retire before next task |
-| Wall time alive | registry `spawned_at` | very long-running instances get a periodic "still healthy?" check |
-| Semantic boundary | sprint file status changes + planner judgment | story `[DONE]` + next story is meaningfully different → fresh instance even if well under budget; same applies when an unrelated bug arrives |
-| Mailbox volume from/to agent | `mailbox.jsonl` count | proxy for "how much has this agent been juggling" |
+```json
+{
+  "name": "coder",
+  "status": "alive",
+  "claude_session_id": "...",
+  "alive_seconds": 1830,
+  "tokens_in": 4123, "tokens_out": 8912,
+  "tokens_cache_read": 280000, "tokens_cache_create": 35000,
+  "tokens_total": 328035,
+  "mailbox_sent": 14, "mailbox_received": 22
+}
+```
 
-Planner reads these on each cycle and decides whether to recycle. Recycle = `squad kill <name>` (graceful — agent gets `retiring_in 30s`, writes handoff) then `squad spawn <role>` (new instance reads handoff and picks up the next task). Story 4's resume preamble already covers the pickup side.
+The harness does not interpret these numbers. The planner reads them whenever it wants (mid-cycle, after a story passes, on user prompt) and decides whether to recycle. Heuristics for "context heavy" or "semantic boundary" live entirely in the planner's conversation with you — not in any role file.
 
-**Critical rule (encoded in planner.md):** Even with a half-empty token budget, when the *next* task is meaningfully unrelated to what the current agent has been doing (new bug type, new story building on different surfaces, new testing dimension), the planner spawns a fresh instance. Context boundaries are semantic, not just numeric.
+**(C) Recycle convenience verb.** `squad recycle <name> [--reason "..."] [--grace-seconds N] [--fresh]` does `kill + spawn` in one call:
+- Default: preserves the Claude session id (`--resume`) and worktree — the planner uses this when it just wants a state checkpoint, not a context wipe.
+- `--fresh`: assigns a new Claude session id and archives the handoff — used when the planner judges the next task is unrelated to what the agent has been doing.
+- Broadcasts `recycling` mailbox event with `reason` so peers see why.
+
+**No role file changes.** The planner doesn't need a "Fatigue Watcher" section telling it how to interpret usage numbers — it discovers `squad usage` via `squad help` or because you tell it, and decides per-situation. Future improvement: package recycling heuristics as a skill the planner can invoke.
 
 **Demo after this story:**
-- `squad start`, plan a 2-story sprint, say "go."
-- Planner spawns coder. Coder implements Story 1.1, talks directly to tester via mailbox. Tester verifies, posts `result`. Story 1.1 marked `[DONE]`.
-- Planner sees Story 1.1 done + Story 1.2 is queued. Decides 1.2 deserves a fresh coder (semantic boundary). Sends `retiring_in 30s` to coder, runs `squad kill coder`, then `squad spawn coder` for 1.2.
-- New coder picks up from handoff, implements 1.2, also talks to the same tester directly.
-- During 1.2, push the coder hard (force it to use ~140k tokens). On next cycle, planner sees the budget signal and proactively recycles it after current work flushes.
-- Inspect: `cat .squad/mailbox.jsonl | jq` shows the free-flowing peer messages + the planner's retiring/spawn events with rationale in the body.
+- `squad start`, `squad spawn coder`, `squad spawn tester`.
+- Have coder and tester exchange a few messages (`squad_mailbox_send` from the shell or just type into the panes asking each to talk).
+- `squad usage coder` → JSON with token counts, time alive, mailbox sent/received.
+- `squad recycle coder --reason "test"` → graceful kill + same-session respawn; `claude_session_id` unchanged.
+- `squad recycle coder --reason "next task is unrelated" --fresh` → new session id, archived handoff.
+- `jq` the mailbox to see the `recycling` events with reasons attached.
 
 **Out of scope this story:** vertical-slice sprint template (Story 6), MCP Playwright (Story 7), reviewer (Story 8).
 
@@ -227,3 +238,9 @@ End-to-end demo on a fresh scratch repo:
 - **Mailbox JSONL grows unbounded** — add rotation policy later, not in v1.
 - **Planner singleton enforcement** — `cmd_spawn planner` should refuse explicitly.
 - **Worktree dirty state on resume** — resume preamble must tell coder to `git status` first and decide stash vs keep.
+
+---
+
+## Deferred improvements (queued)
+
+- **Click-to-focus panes** — tmux ignores mouse clicks by default; you have to use `Ctrl+B + arrow` to switch panes. Adding `tmux set-option -t claude-squad mouse on` right after `new-session` (in `lib/tmux.sh`'s `squad_tmux_create_single_pane`) scopes mouse mode to the squad session only, so you can click panes to make them active without overriding your global tmux preferences. Side benefits: scroll-wheel works, drag-to-resize pane borders works. Side effect to know: selecting text with the mouse goes through tmux's copy mode rather than the terminal's native selection.

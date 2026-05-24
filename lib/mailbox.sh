@@ -11,9 +11,24 @@ squad_mailbox_init() {
   echo "$mailbox"
 }
 
-# Send a message to the mailbox
+# Send a message to the mailbox.
 # Usage: squad_mailbox_send <squad_dir> <from_role> <to_role> <type> <body>
-# Types: notification, request, result, bug, status_update, sprint_contract
+#
+# Type catalog (none enforced — agents choose what fits the moment):
+#   Peer-to-peer (agents talk freely between each other):
+#     notification  FYI broadcast; no response expected
+#     request       asks recipient for a specific action
+#     ack / decline response to a request
+#     result        delivers an artifact (path, summary, verdict)
+#     clarify       direct question to another agent
+#     block         "I'm stuck, here's what I need"
+#     status_update heartbeat or progress update
+#     redirect      "stop X, do Y instead"
+#   System lifecycle events (emitted by the CLI verbs):
+#     agent_spawned, agent_closing, agent_closed, agent_vanished, retiring_in
+#
+# The body is a free-form string. Agents may put JSON in it when structured
+# fields help; the CLI uses JSON bodies for lifecycle events.
 squad_mailbox_send() {
   local squad_dir="$1"
   local from="$2"
